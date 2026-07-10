@@ -1,12 +1,13 @@
 import os
 import sys
+import asyncio
 import logging
-from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname
+from libonvif.devices.camera import Camera, discover
 from libonvif.utils.adapters import find_adapters
 import niquests as requests
-from urllib.parse import urlparse
+from camera import get_camera_mcp_version
 
-from niquests.auth import HTTPBasicAuth, HTTPDigestAuth
+from niquests.auth import HTTPDigestAuth
 
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def on_error(xaddr: str, ex: Exception) -> None:
 def camera_filled(camera: Camera) -> None:
     logger.debug(f"Camera Filled: {camera.hostname.name} : {camera.device_information.serial_number}")
 
-def main():
+def iterate_cameras_and_get_snapshots():
     logger.debug("Starting test...")
     adapters = find_adapters()
     for adapter in adapters:
@@ -40,9 +41,6 @@ def main():
 
         if camera.hostname.name:
             logger.debug(f"Found camera {camera.hostname.name}")
-            parsed = urlparse(uri)
-            simple_url = f"{parsed.scheme}://{camera.username}:{camera.password}@{parsed.netloc}{parsed.path}?{parsed.query}"
-            logger.debug(f"Simple URL: {simple_url}")
             response = requests.get(uri, auth=HTTPDigestAuth(camera.username, camera.password), timeout=5)
             logger.debug(f"Response status code: {response.status_code}")
             if response.status_code == 200:
@@ -54,5 +52,10 @@ def main():
                 logger.error(f"Failed to access the camera snapshot. Status code: {response.status_code}")
 
 
+async def main() -> None:
+    logger.debug("Starting main function...")
+    version = await get_camera_mcp_version()
+    logger.debug(f"Camera MCP Version: {version}")
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

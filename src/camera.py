@@ -1,5 +1,6 @@
 import base64
 import logging
+from pathlib import Path
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname
 from mcp.server.fastmcp import FastMCP
@@ -15,7 +16,6 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("camera")
 
 USER_AGENT = "camera-app/1.0"
-VERSION = "0.1.0"
 
 def get_camera_credentials(camera: Camera) -> None:
     camera.username = os.environ.get("CAMERA_USERNAME", "")
@@ -33,9 +33,19 @@ async def get_camera_mcp_version() -> str:
     Get the version of the camera application.
 
     Returns:
-        The version string.
+        The version string as derived from the pyproject.toml file.
     """
-    return VERSION
+
+    current_file = Path(__file__)
+    filename = Path(current_file.parent.parent) / "pyproject.toml"
+    with open(filename, "r") as f:
+        for line in f:
+            if line.startswith("version"):
+                version = line.split("=")[1].strip().strip('"')
+                logger.debug(f"Found version: {version}")
+                return version
+
+    return None 
 
 @mcp.tool()
 async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
