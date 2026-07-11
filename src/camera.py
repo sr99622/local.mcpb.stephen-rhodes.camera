@@ -69,11 +69,14 @@ async def set_camera_profile_resolution(ip_address: str, profile_token: str, wid
 
     try:
         resolution = f"{width} x {height}"
+        camera.errors = None
         
         for profile in camera.profiles:
             if profile.token == profile_token:
                 profile.video_encoder.resolution = resolution
                 set_video_encoder_configuration(camera, profile.video_encoder)
+                if camera.errors:
+                    raise Exception(f"Camera returned errors: {camera.errors}")
                 return f"Successfully set video encoder configuration for camera at {ip_address} to {resolution}."
 
     except Exception as e:
@@ -98,7 +101,10 @@ async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
 
     try:
         camera.hostname.name = new_hostname
+        camera.errors = None
         set_hostname(camera)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
         return f"Successfully changed hostname of camera at {ip_address} to {new_hostname}."
     except Exception as e:
         logger.error(f"Failed to change hostname for camera at {ip_address}: {e}")
