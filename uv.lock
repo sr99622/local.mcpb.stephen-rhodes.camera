@@ -44,7 +44,7 @@ wheels = [
 
 [[package]]
 name = "camera"
-version = "0.0.10"
+version = "0.0.13"
 source = { virtual = "." }
 dependencies = [
     { name = "libonvif" },
@@ -54,7 +54,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "libonvif", specifier = "==4.0.2" },
+    { name = "libonvif", directory = "../libonvif/packages/libonvif" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "niquests" },
 ]
@@ -518,17 +518,21 @@ wheels = [
 
 [[package]]
 name = "libonvif"
-version = "4.0.2"
-source = { registry = "https://pypi.org/simple" }
+version = "4.0.4"
+source = { directory = "../libonvif/packages/libonvif" }
 dependencies = [
     { name = "lxml" },
     { name = "niquests" },
     { name = "psutil" },
     { name = "textual" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/d3/e5524a5cb2b06ab20666dd45737a4ba185b012e84ce933e671136404e078/libonvif-4.0.2.tar.gz", hash = "sha256:d332a8d0b3097c3bb735b830657429799e8f9a0896c9ad417e1133893ec6a129", size = 26708, upload-time = "2026-06-28T03:54:44.729Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/dc/c8/b65c67d4fe7f11b64293da6078deb1c03f932091f0084cd98ca6eee9327e/libonvif-4.0.2-py3-none-any.whl", hash = "sha256:92eaf3f99e7cc9cc05f51b8dab4bcbe77c784e57092b4adf4dcefeb59eade219", size = 34176, upload-time = "2026-06-28T03:54:42.978Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "lxml" },
+    { name = "niquests" },
+    { name = "psutil" },
+    { name = "textual" },
 ]
 
 [[package]]

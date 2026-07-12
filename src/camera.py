@@ -3,19 +3,16 @@ import json
 import logging
 from importlib.metadata import version as get_installed_version
 from pathlib import Path
-from attrs import asdict
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
-        set_video_encoder_configuration
+        set_video_encoder_configuration, camera_from_json
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
 import webbrowser
 import niquests as requests
 from niquests.auth import HTTPDigestAuth
-from dataclasses import asdict
-import json
-
+import re
 
 
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
@@ -34,6 +31,50 @@ def on_error(xaddr: str, ex: Exception) -> None:
 
 def camera_filled(camera: Camera) -> None:
     logger.debug(f"Camera Filled: {camera.hostname} : {camera.device_information.serial_number}")
+
+def list_files(directory):
+    """Recursively list all files in a directory."""
+    for root, _, files in os.walk(directory):
+        for file in files:
+            yield os.path.join(root, file)
+
+@mcp.tool()
+def grep_search(pattern, directory, fileExtension=None):
+    """Search for a regex pattern in files under a directory."""
+    results = []
+
+    # Validate directory
+    if not os.path.isdir(directory):
+        return {"error": f"Directory not found: {directory}"}
+
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return {"error": f"Invalid regex: {e}"}
+
+    try:
+        for file_path in list_files(directory):
+            if fileExtension and not file_path.endswith(fileExtension):
+                continue
+
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line_num, line in enumerate(f, start=1):
+                        if regex.search(line):
+                            results.append({
+                                "file": file_path,
+                                "lineNum": line_num,
+                                "line": line.strip()
+                            })
+            except (OSError, UnicodeDecodeError):
+                # Skip unreadable files
+                continue
+
+    except Exception as e:
+        return {"error": f"Search failed: {e}"}
+
+    return {"matches": results}
+
 
 @mcp.tool()
 async def get_camera_mcp_version() -> str:
@@ -70,13 +111,13 @@ async def get_camera_mcp_version() -> str:
     }, indent=4)
 
 @mcp.tool()
-async def set_camera_profile_resolution(ip_address: str, profile_token: str, width: int, height: int) -> str:
+async def set_camera_profile_resolution(json_string: str, profile_token: str, width: int, height: int) -> str:
     """
     Set the video encoder configuration for a camera. Please note that the width and height must be supported 
     by the camera's media profile. If the requested resolution is not supported, the camera may return an error.
 
     Args:
-        ip_address: The IP address of the camera to configure.
+        json_string: The JSON string representation of the camera, as returned by get_camera or get_cameras.
         profile_token: The media profile token to configure.
         width: The desired width of the video resolution.
         height: The desired height of the video resolution.
@@ -84,9 +125,11 @@ async def set_camera_profile_resolution(ip_address: str, profile_token: str, wid
     Returns:
         A message indicating success or failure
     """
-    camera = get_camera_by_ip(ip_address, os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", ""))
-    if not camera:
-        return f"Camera with IP {ip_address} not found."
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
 
     try:
         resolution = f"{width} x {height}"
@@ -98,27 +141,29 @@ async def set_camera_profile_resolution(ip_address: str, profile_token: str, wid
                 set_video_encoder_configuration(camera, profile.video_encoder)
                 if camera.errors:
                     raise Exception(f"Camera returned errors: {camera.errors}")
-                return f"Successfully set video encoder configuration for camera at {ip_address} to {resolution}."
+                return f"Successfully set video encoder configuration for camera at {camera.xaddr} to {resolution}."
 
     except Exception as e:
-        logger.error(f"Failed to set video encoder configuration for camera at {ip_address}: {e}")
-        return f"Failed to set video encoder configuration for camera at {ip_address}: {e}"
+        logger.error(f"Failed to set video encoder configuration for camera at {camera.xaddr}: {e}")
+        return f"Failed to set video encoder configuration for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
+async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
     """
     Change the hostname of a camera.
 
     Args:
-        ip_address: The IP address of the camera to change.
+        json_string: The JSON string representation of the camera, as returned by get_camera or get_cameras.
         new_hostname: The new hostname to set.
 
     Returns:
         A message indicating success or failure
     """
-    camera = get_camera_by_ip(ip_address, os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", ""))
-    if not camera:
-        return f"Camera with IP {ip_address} not found."
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
 
     try:
         camera.hostname.name = new_hostname
@@ -126,10 +171,10 @@ async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
         set_hostname(camera)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully changed hostname of camera at {ip_address} to {new_hostname}."
+        return f"Successfully changed hostname of camera at {camera.xaddr} to {new_hostname}."
     except Exception as e:
-        logger.error(f"Failed to change hostname for camera at {ip_address}: {e}")
-        return f"Failed to change hostname for camera at {ip_address}: {e}"
+        logger.error(f"Failed to change hostname for camera at {camera.xaddr}: {e}")
+        return f"Failed to change hostname for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def check_camera_mcp_environment() -> str:
@@ -256,7 +301,7 @@ async def get_camera(ip_address: str) -> str:
     """
 
     camera = get_camera_by_ip(ip_address, os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", ""))
-    return json.dumps(asdict(camera), indent=4)
+    return camera.to_json()
 
 @mcp.tool()
 async def get_cameras() -> str:
@@ -289,10 +334,7 @@ async def get_cameras() -> str:
 
     names = []
     for camera in cameras:
-        camera_dict = asdict(camera)
-        camera_dict.pop("on_error", None)
-        camera_info = json.dumps(camera_dict, indent=4)
-        names.append(camera_info)
+        names.append(camera.to_json())
 
     return "\n--\n".join(names)
 
