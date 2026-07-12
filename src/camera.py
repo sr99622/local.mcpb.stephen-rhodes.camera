@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+from importlib.metadata import version as get_installed_version
 from pathlib import Path
 from attrs import asdict
 from libonvif.utils.adapters import find_adapters
@@ -37,22 +38,36 @@ def camera_filled(camera: Camera) -> None:
 @mcp.tool()
 async def get_camera_mcp_version() -> str:
     """
-    Get the version of the camera application.
+    Get the version of the camera application, along with the version of the
+    installed libonvif package it depends on.
 
     Returns:
-        The version string as derived from the pyproject.toml file.
+        A JSON string with two fields:
+            camera_mcp_version: version derived from the pyproject.toml file.
+            libonvif_version: version of the installed libonvif package,
+                               read via importlib.metadata.
     """
 
+    camera_mcp_version = None
     current_file = Path(__file__)
     filename = Path(current_file.parent.parent) / "pyproject.toml"
     with open(filename, "r") as f:
         for line in f:
             if line.startswith("version"):
-                version = line.split("=")[1].strip().strip('"')
-                logger.debug(f"Found version: {version}")
-                return version
+                camera_mcp_version = line.split("=")[1].strip().strip('"')
+                logger.debug(f"Found camera_mcp version: {camera_mcp_version}")
+                break
 
-    return None 
+    try:
+        libonvif_version = get_installed_version("libonvif")
+    except Exception as e:
+        logger.error(f"Failed to get libonvif version: {e}")
+        libonvif_version = None
+
+    return json.dumps({
+        "camera_mcp_version": camera_mcp_version,
+        "libonvif_version": libonvif_version,
+    }, indent=4)
 
 @mcp.tool()
 async def set_camera_profile_resolution(ip_address: str, profile_token: str, width: int, height: int) -> str:
@@ -274,9 +289,10 @@ async def get_cameras() -> str:
 
     names = []
     for camera in cameras:
-        #camera_info = json.dumps(asdict(camera), indent=4)
-        #names.append(camera_info)
-        names.append(f"{camera.hostname.name} : {camera.xaddr} : {camera.device_information.serial_number}")
+        camera_dict = asdict(camera)
+        camera_dict.pop("on_error", None)
+        camera_info = json.dumps(camera_dict, indent=4)
+        names.append(camera_info)
 
     return "\n--\n".join(names)
 
