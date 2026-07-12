@@ -5,13 +5,21 @@ This example uses the UV runtime
 Please note that the installer will only work partially, you have to edit the json file manually as before.
 
 ```
-{
   "mcpServers": {
+    "git": {
+      "command": "uv",
+      "args": [
+        "--directory", 
+        "C:\\Users\\sr996\\Projects\\servers\\src\\git",
+        "run",
+        "src\\mcp_server_git"
+      ]
+    },    
     "camera": {
       "command": "uv",
       "args": [
         "--directory",
-        "C:\\Users\\sr996\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\Claude\\Claude Extensions\\local.mcpb.stephen-rhodes.camera\\src",
+        "C:\\Users\\sr996\\Projects\\local.mcpb.stephen-rhodes.camera\\src",
         "run",
         "camera.py"
       ],

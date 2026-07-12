@@ -1,6 +1,8 @@
 import base64
+import json
 import logging
 from pathlib import Path
+from attrs import asdict
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration
@@ -10,6 +12,10 @@ import sys
 import webbrowser
 import niquests as requests
 from niquests.auth import HTTPDigestAuth
+from dataclasses import asdict
+import json
+
+
 
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -233,8 +239,9 @@ async def get_camera(ip_address: str) -> str:
     Returns:
         A string representation of the camera's information.
     """
+
     camera = get_camera_by_ip(ip_address, os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", ""))
-    return f"{camera}"
+    return json.dumps(asdict(camera), indent=4)
 
 @mcp.tool()
 async def get_cameras() -> str:
@@ -245,7 +252,9 @@ async def get_cameras() -> str:
         None
 
     Returns:
-        A delimited string containing camera information
+        A delimited string containing full camera information in json format 
+        for each camera found on the local network. Each camera's information 
+        is separated by "\n--\n".
     """
 
     ip_address = "0.0.0.0"
@@ -265,8 +274,10 @@ async def get_cameras() -> str:
 
     names = []
     for camera in cameras:
+        #camera_info = json.dumps(asdict(camera), indent=4)
+        #names.append(camera_info)
         names.append(f"{camera.hostname.name} : {camera.xaddr} : {camera.device_information.serial_number}")
-    
+
     return "\n--\n".join(names)
 
 def main():

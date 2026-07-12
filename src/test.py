@@ -5,7 +5,7 @@ import logging
 from libonvif.devices.camera import Camera, discover
 from libonvif.utils.adapters import find_adapters
 import niquests as requests
-from camera import get_camera_mcp_version, set_camera_profile_resolution
+from camera import get_camera_mcp_version, set_camera_profile_resolution, get_cameras, get_camera
 
 from niquests.auth import HTTPDigestAuth
 
@@ -63,8 +63,8 @@ async def main() -> None:
     version = await get_camera_mcp_version()
     logger.debug(f"Camera MCP Version: {version}")
 
-    result = await set_camera_resolution()
-    logger.debug(f"Set camera resolution result: {result}")
+    camera = await get_camera("10.1.1.78")
+    logger.debug(f"{camera}") 
 
 if __name__ == "__main__":
     asyncio.run(main())
