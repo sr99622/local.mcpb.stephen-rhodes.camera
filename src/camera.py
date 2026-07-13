@@ -5,7 +5,7 @@ from importlib.metadata import version as get_installed_version
 from pathlib import Path
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
-        set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json
+        set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -452,6 +452,51 @@ async def get_camera(ip_address: str) -> str:
 
     camera = get_camera_by_ip(ip_address, os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", ""))
     return camera.to_json()
+
+@mcp.tool()
+async def update_camera_data(json_string: str) -> str:
+    """
+    Re-query a camera fresh, using the xaddr and credentials currently set
+    in the given camera JSON.
+
+    Use this after editing username or password in the JSON returned by
+    get_camera/get_cameras - for example, to try different credentials
+    against a camera that failed authorization the first time. The edited
+    credentials are what get used for the fresh query, not whatever was
+    originally used. Any other edits made elsewhere in the JSON are
+    ignored, since this re-runs the full query from scratch rather than
+    patching the existing data - the returned camera reflects the device's
+    actual current state, not your edits (aside from username/password,
+    which control how the query is authorized).
+
+    Do not edit xaddr. It is the camera's own self-reported device service
+    address, discovered without authorization, and functions as the
+    camera's network identity rather than a configurable setting. Changing
+    it points this tool at a different device entirely rather than
+    re-querying the same camera.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras, with the
+                     desired username/password already edited.
+
+    Returns:
+        The freshly queried camera as a JSON string, or an error message
+        if the JSON could not be parsed or the query itself failed (e.g.
+        the credentials are still not authorized).
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        refreshed = refresh_camera(camera)
+        return refreshed.to_json()
+    except Exception as e:
+        logger.error(f"Failed to refresh camera at {camera.xaddr}: {e}")
+        return f"Failed to refresh camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def get_cameras() -> str:
