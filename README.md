@@ -2,7 +2,19 @@
 
 This example uses the UV runtime
 
-Please note that the installer will only work partially, you have to edit the json file manually as before.
+Please note that you have to edit the json file manually. The file can be found using Claude Desktop. Go to File->Settings->Developer and click the Edit Config button. This will bring up a file browser highlighting the claude_dekstop_config.json file. Adjust these settings to your current situation and paste them into the json at the top.
+
+you can get the git server from 
+
+```
+git clone https://github.com/modelcontextprotocol/servers.git
+```
+
+and the libonvif MCP at
+
+```
+git clone https://github.com/sr996222/local.mcpb.stephen-rhodes.camera
+```
 
 ```
   "mcpServers": {
