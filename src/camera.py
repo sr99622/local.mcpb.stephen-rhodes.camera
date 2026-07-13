@@ -5,7 +5,7 @@ from importlib.metadata import version as get_installed_version
 from pathlib import Path
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
-        set_video_encoder_configuration, camera_from_json
+        set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -202,6 +202,100 @@ async def set_camera_video_encoder(json_string: str, profile_token: str) -> str:
     except Exception as e:
         logger.error(f"Failed to set video encoder configuration for camera at {camera.xaddr}: {e}")
         return f"Failed to set video encoder configuration for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def set_camera_audio_encoder(json_string: str, profile_token: str) -> str:
+    """
+    Push the audio_encoder configuration for one media profile to a camera.
+
+    Like set_camera_video_encoder, this tool works directly on the camera's
+    JSON representation (as returned by get_camera or get_cameras): edit
+    whichever fields you want to change inside
+    profiles[profile_token].audio_encoder in that JSON, then pass the
+    edited JSON string back in here. Every field currently set under that
+    profile's audio_encoder is pushed to the camera in a single ONVIF call.
+
+    Only the audio_encoder node of the matching profile is read and pushed.
+    Edits made anywhere else in the JSON (device_information, hostname,
+    video_encoder, other profiles, etc.) are ignored by this tool.
+
+    Editable fields under profiles[profile_token].audio_encoder, and how to
+    choose a valid value for each:
+
+        encoding
+            The codec name, e.g. "G711" or "AAC". Must match one of the
+            entries in this same profile's audio_encoder_options list (each
+            entry there has its own .encoding).
+
+        bitrate
+            Integer bitrate. Must be one of the values in
+            audio_encoder_options[i].bitrate_list for the entry whose
+            .encoding matches this encoder's encoding.
+
+            Note: on at least some hardware (observed on an Amcrest G711
+            implementation), bitrate and sample_rate appear to be coupled -
+            changing bitrate alone was silently ignored by the camera, while
+            changing sample_rate caused bitrate to change along with it.
+            If you need a specific bitrate, try setting sample_rate to the
+            value that pairs with it and verify both fields with a fresh
+            get_camera call afterward, since a "success" response does not
+            guarantee every field you set was actually applied.
+
+        sample_rate
+            Integer sample rate. Must be one of the values in
+            audio_encoder_options[i].sample_rate_list for the entry whose
+            .encoding matches this encoder's encoding.
+
+            See the note under bitrate above - on some hardware this is the
+            field that actually drives the change, with bitrate following
+            it rather than being independently settable.
+
+        multicast.ip_address
+            A multicast IPv4 address (224.0.0.0-239.255.255.255). Leave as
+            the camera's existing value unless you specifically need to
+            change the multicast group.
+
+        multicast.port
+            Integer UDP port for the multicast stream.
+
+        multicast.ttl
+            Integer time-to-live (hop count) for multicast packets.
+
+        session_timeout
+            An ISO 8601 duration string, e.g. "PT30S" for 30 seconds.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras, with the desired
+                     changes already made under
+                     profiles[profile_token].audio_encoder.
+        profile_token: The media profile token whose audio_encoder should be
+                       pushed to the camera.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+
+        for profile in camera.profiles:
+            if profile.token == profile_token:
+                set_audio_encoder_configuration(camera, profile.audio_encoder)
+                if camera.errors:
+                    raise Exception(f"Camera returned errors: {camera.errors}")
+                return f"Successfully set audio encoder configuration for camera at {camera.xaddr}, profile {profile_token}."
+
+        return f"Profile {profile_token} not found on camera at {camera.xaddr}."
+
+    except Exception as e:
+        logger.error(f"Failed to set audio encoder configuration for camera at {camera.xaddr}: {e}")
+        return f"Failed to set audio encoder configuration for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
