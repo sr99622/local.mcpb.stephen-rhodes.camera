@@ -111,16 +111,72 @@ async def get_camera_mcp_version() -> str:
     }, indent=4)
 
 @mcp.tool()
-async def set_camera_profile_resolution(json_string: str, profile_token: str, width: int, height: int) -> str:
+async def set_camera_video_encoder(json_string: str, profile_token: str) -> str:
     """
-    Set the video encoder configuration for a camera. Please note that the width and height must be supported 
-    by the camera's media profile. If the requested resolution is not supported, the camera may return an error.
+    Push the video_encoder configuration for one media profile to a camera.
+
+    Unlike a function with individual arguments per setting, this tool works
+    directly on the camera's JSON representation (as returned by get_camera
+    or get_cameras): edit whichever fields you want to change inside
+    profiles[profile_token].video_encoder in that JSON, then pass the
+    edited JSON string back in here. Every field currently set under that
+    profile's video_encoder is pushed to the camera in a single ONVIF call -
+    there is no need for a separate tool per field.
+
+    Only the video_encoder node of the matching profile is read and pushed.
+    Edits made anywhere else in the JSON (device_information, hostname,
+    network_interfaces, other profiles, etc.) are ignored by this tool.
+
+    Editable fields under profiles[profile_token].video_encoder, and how to
+    choose a valid value for each:
+
+        encoding
+            The codec name, e.g. "H264". Must be one of the codecs the
+            camera actually offers - check which of jpeg / mpeg4 / h264 are
+            non-null under this same profile's video_encoder_options.
+
+        resolution
+            A string in the exact format f"{width} x {height}" (e.g.
+            "1920 x 1080"). The (width, height) pair must be one of the
+            entries in video_encoder_options.<codec>.resolutions_available
+            for this profile's encoding (e.g. video_encoder_options.h264.
+            resolutions_available when encoding is "H264"). Do not invent a
+            resolution not present in that list.
+
+        rate_control.frame_rate_limit
+            Integer frames per second. Must fall within
+            video_encoder_options.<codec>.frame_rate_range (min/max).
+
+        multicast.ip_address
+            A multicast IPv4 address (224.0.0.0-239.255.255.255). Leave as
+            the camera's existing value unless you specifically need to
+            change the multicast group.
+
+        multicast.port
+            Integer UDP port for the multicast stream.
+
+        multicast.ttl
+            Integer time-to-live (hop count) for multicast packets.
+
+        session_timeout
+            An ISO 8601 duration string, e.g. "PT60S" for 60 seconds.
+
+        gov_length
+            Integer GOP length (frames between keyframes). Must fall within
+            video_encoder_options.<codec>.gov_length_range (min/max).
+
+        profile
+            The H.264 profile name, e.g. "Baseline", "Main", or "High".
+            Must be one of the entries in
+            video_encoder_options.h264.profiles_supported.
 
     Args:
-        json_string: The JSON string representation of the camera, as returned by get_camera or get_cameras.
-        profile_token: The media profile token to configure.
-        width: The desired width of the video resolution.
-        height: The desired height of the video resolution.
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras, with the desired
+                     changes already made under
+                     profiles[profile_token].video_encoder.
+        profile_token: The media profile token whose video_encoder should be
+                       pushed to the camera.
 
     Returns:
         A message indicating success or failure
@@ -132,16 +188,16 @@ async def set_camera_profile_resolution(json_string: str, profile_token: str, wi
         return f"Failed to parse camera JSON: {e}"
 
     try:
-        resolution = f"{width} x {height}"
         camera.errors = None
-        
+
         for profile in camera.profiles:
             if profile.token == profile_token:
-                profile.video_encoder.resolution = resolution
                 set_video_encoder_configuration(camera, profile.video_encoder)
                 if camera.errors:
                     raise Exception(f"Camera returned errors: {camera.errors}")
-                return f"Successfully set video encoder configuration for camera at {camera.xaddr} to {resolution}."
+                return f"Successfully set video encoder configuration for camera at {camera.xaddr}, profile {profile_token}."
+
+        return f"Profile {profile_token} not found on camera at {camera.xaddr}."
 
     except Exception as e:
         logger.error(f"Failed to set video encoder configuration for camera at {camera.xaddr}: {e}")
