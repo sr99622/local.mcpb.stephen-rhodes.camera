@@ -5,7 +5,8 @@ from importlib.metadata import version as get_installed_version
 from pathlib import Path
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
-        set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera
+        set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
+        goto_preset
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -296,6 +297,66 @@ async def set_camera_audio_encoder(json_string: str, profile_token: str) -> str:
     except Exception as e:
         logger.error(f"Failed to set audio encoder configuration for camera at {camera.xaddr}: {e}")
         return f"Failed to set audio encoder configuration for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def goto_camera_preset(json_string: str, profile_token: str, preset_token: str) -> str:
+    """
+    Move a PTZ camera to one of its stored presets.
+
+    Presets are found at camera.ptz.presets in the camera's JSON
+    representation (as returned by get_camera/get_cameras) - a list of
+    PTZPreset entries, each with a token and a (often blank) name. Find
+    the preset you want by matching its token or name in that list, then
+    pass its token here as preset_token.
+
+    profile_token should almost always be the camera's main media profile
+    token - typically profiles[0].token, e.g. "MediaProfile000" - since
+    PTZ presets are defined per-profile and the main profile is where
+    they're normally stored.
+
+    This tool only sends the move command; it does not wait for the
+    camera to finish moving or confirm it arrived. To check on that,
+    call get_camera again afterward and look at ptz.status.pan_tilt_status
+    and ptz.status.zoom_status ("IDLE" once the move has completed) and
+    ptz.status.position for the camera's current position.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (see above).
+        preset_token: The token of the preset to move to, from
+                      camera.ptz.presets in the same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    if not camera.ptz or not camera.ptz.presets:
+        return f"Camera at {camera.xaddr} has no PTZ presets available."
+
+    preset = None
+    for candidate in camera.ptz.presets:
+        if candidate.token == preset_token:
+            preset = candidate
+            break
+
+    if not preset:
+        return f"Preset {preset_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        goto_preset(camera, profile_token, preset)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully moved camera at {camera.xaddr} to preset {preset_token}."
+    except Exception as e:
+        logger.error(f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}")
+        return f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}"
 
 @mcp.tool()
 async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
