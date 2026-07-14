@@ -6,7 +6,8 @@ from pathlib import Path
 from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
-        goto_preset
+        goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
+        get_time_offset
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -359,6 +360,177 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
         return f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}"
 
 @mcp.tool()
+async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
+    """
+    Start a continuous pan/tilt move on a PTZ camera.
+
+    x and y are normalized velocities in the range -1.0 to 1.0 (0.0 means
+    no motion on that axis): positive x pans right, negative x pans left;
+    positive y tilts up, negative y tilts down. These are velocities, not
+    positions - the camera keeps moving in that direction at that speed
+    until stop_camera_pan_tilt is called.
+
+    This does not stop on its own except at the camera's physical pan/tilt
+    limits - most PTZ hardware halts at its mechanical range ends, so
+    forgetting to stop is not unsafe, but the camera will simply drift to
+    whichever limit it's heading toward and park there rather than stopping
+    at a precise point. Call stop_camera_pan_tilt to halt motion exactly
+    where you want it, or check ptz.status.position via get_camera to see
+    where it ended up.
+
+    This is pan/tilt only - it has no effect on zoom. Use zoom_camera
+    separately for zoom; a camera can only perform one of pan/tilt or zoom
+    at a time.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        x: Pan velocity, -1.0 (left) to 1.0 (right). 0.0 for no pan.
+        y: Tilt velocity, -1.0 (down) to 1.0 (up). 0.0 for no tilt.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        continuous_move(camera, profile_token, x, y, 0)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully started pan/tilt move on camera at {camera.xaddr} (x={x}, y={y})."
+    except Exception as e:
+        logger.error(f"Failed to start pan/tilt move on camera at {camera.xaddr}: {e}")
+        return f"Failed to start pan/tilt move on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def zoom_camera(json_string: str, profile_token: str, z: float) -> str:
+    """
+    Start a continuous zoom move on a PTZ camera.
+
+    z is a normalized velocity in the range -1.0 to 1.0, excluding 0.0:
+    positive zooms in (telephoto), negative zooms out (wide). This is a
+    velocity, not a position - the camera keeps zooming at that speed
+    until stop_camera_zoom is called. z=0.0 is rejected here rather than
+    silently doing nothing; use stop_camera_zoom if you want to halt an
+    in-progress zoom.
+
+    This does not stop on its own except at the camera's physical zoom
+    limits (fully wide or fully telephoto) - most PTZ hardware halts
+    there, so forgetting to stop is not unsafe, but the camera will simply
+    zoom to whichever limit it's heading toward and stop there rather than
+    at a precise point. Call stop_camera_zoom to halt zoom exactly where
+    you want it, or check ptz.status.position.zoom via get_camera to see
+    where it ended up.
+
+    This is zoom only - it has no effect on pan/tilt. Use pan_tilt_camera
+    separately for pan/tilt; a camera can only perform one of pan/tilt or
+    zoom at a time.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        z: Zoom velocity, -1.0 (zoom out) to 1.0 (zoom in). Must not be 0.0.
+
+    Returns:
+        A message indicating success or failure
+    """
+    if z == 0:
+        return "z must not be 0.0 - to stop an in-progress zoom, call stop_camera_zoom instead."
+
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        continuous_move(camera, profile_token, 0, 0, z)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully started zoom move on camera at {camera.xaddr} (z={z})."
+    except Exception as e:
+        logger.error(f"Failed to start zoom move on camera at {camera.xaddr}: {e}")
+        return f"Failed to start zoom move on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def stop_camera_pan_tilt(json_string: str, profile_token: str) -> str:
+    """
+    Stop an in-progress continuous pan/tilt move started by pan_tilt_camera.
+
+    Has no effect on zoom - use stop_camera_zoom to stop a zoom move. If no
+    pan/tilt move is currently in progress, this is a harmless no-op on
+    most cameras.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (should match
+                       whatever was used in the pan_tilt_camera call).
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        move_stop(camera, profile_token, is_zoom=False)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully stopped pan/tilt move on camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to stop pan/tilt move on camera at {camera.xaddr}: {e}")
+        return f"Failed to stop pan/tilt move on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def stop_camera_zoom(json_string: str, profile_token: str) -> str:
+    """
+    Stop an in-progress continuous zoom move started by zoom_camera.
+
+    Has no effect on pan/tilt - use stop_camera_pan_tilt to stop a pan/tilt
+    move. If no zoom move is currently in progress, this is a harmless
+    no-op on most cameras.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (should match
+                       whatever was used in the zoom_camera call).
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        move_stop(camera, profile_token, is_zoom=True)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully stopped zoom move on camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to stop zoom move on camera at {camera.xaddr}: {e}")
+        return f"Failed to stop zoom move on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
 async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
     """
     Change the hostname of a camera.
@@ -386,6 +558,49 @@ async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
     except Exception as e:
         logger.error(f"Failed to change hostname for camera at {camera.xaddr}: {e}")
         return f"Failed to change hostname for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def sync_camera_time(json_string: str) -> str:
+    """
+    Synchronize a camera's clock to this machine's current local time.
+
+    Useful for correcting a camera whose internal clock has drifted or
+    reset (e.g. after a power loss reverting it to an epoch default like
+    2000-01-01), which otherwise produces confusing timestamps on
+    snapshots and event data.
+
+    Builds a SystemDateAndTime from this machine's current local and UTC
+    time (matching the timezone-offset format ONVIF expects), pushes it
+    to the camera, then re-queries the camera's own reported time to
+    recalculate time_offset - the difference in seconds between the
+    camera's clock and this machine's, which should end up close to zero
+    once synced.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+
+    Returns:
+        A message indicating success or failure, including the resulting
+        time_offset in seconds if successful.
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        sdt = get_local_date_and_time()
+        set_system_date_and_time(camera, sdt)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        get_time_offset(camera)
+        return f"Successfully synchronized time for camera at {camera.xaddr}. time_offset is now {camera.time_offset} seconds."
+    except Exception as e:
+        logger.error(f"Failed to sync time for camera at {camera.xaddr}: {e}")
+        return f"Failed to sync time for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def check_camera_mcp_environment() -> str:
