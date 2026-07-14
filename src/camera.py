@@ -7,7 +7,7 @@ from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
-        get_time_offset
+        get_time_offset, set_preset, get_presets
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -358,6 +358,107 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
     except Exception as e:
         logger.error(f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}")
         return f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}"
+
+@mcp.tool()
+async def set_camera_preset(json_string: str, profile_token: str, preset_token: str = None, preset_name: str = None) -> str:
+    """
+    Create a new PTZ preset, or overwrite an existing one with the camera's
+    current position.
+
+    Two modes, based on whether preset_token is supplied:
+
+    - preset_token omitted (create mode): the camera creates a brand new
+      preset at its current position. Cameras support a limited number of
+      presets - check how many already exist in camera.ptz.presets before
+      creating another, in case the camera silently rejects it once full.
+      If preset_name is given, the new preset is created first, then
+      renamed in a second call - the underlying ONVIF operation can't
+      assign a name to a preset that doesn't have a token yet, so this
+      tool creates it unnamed, determines the token the camera just
+      assigned, then renames it. The camera doesn't move between these
+      two calls, so the rename call safely re-saves the same position.
+
+    - preset_token supplied (overwrite mode): the preset matching that
+      token in camera.ptz.presets has its position overwritten to the
+      camera's CURRENT position - not restored to wherever it used to
+      point. If you only want to rename an existing preset without moving
+      it, first call goto_camera_preset to move the camera back to that
+      preset's own position, THEN call this tool - otherwise the preset's
+      saved position will be silently replaced with wherever the camera
+      happens to be sitting right now. Pass preset_name to also update the
+      preset's stored name at the same time.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        preset_token: Token of an existing preset to overwrite (from
+                      camera.ptz.presets). Omit to create a new preset
+                      instead.
+        preset_name: Optional name to assign to the preset (new or
+                     existing).
+
+    Returns:
+        A message indicating success or failure. On successful creation,
+        includes the newly assigned preset token.
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+
+        if preset_token:
+            preset = None
+            for candidate in (camera.ptz.presets if camera.ptz else []):
+                if candidate.token == preset_token:
+                    preset = candidate
+                    break
+            if not preset:
+                return f"Preset {preset_token} not found on camera at {camera.xaddr}."
+            if preset_name is not None:
+                preset.name = preset_name
+            set_preset(camera, profile_token, preset)
+            if camera.errors:
+                raise Exception(f"Camera returned errors: {camera.errors}")
+            return f"Successfully overwrote preset {preset_token} on camera at {camera.xaddr} with its current position."
+
+        # create mode
+        existing_tokens = {p.token for p in (camera.ptz.presets if camera.ptz else [])}
+        set_preset(camera, profile_token)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+
+        get_presets(camera, profile_token)
+        if camera.errors:
+            raise Exception(f"Camera returned errors while refreshing presets: {camera.errors}")
+
+        new_tokens = [p.token for p in camera.ptz.presets if p.token not in existing_tokens]
+        if not new_tokens:
+            return f"Preset created on camera at {camera.xaddr}, but could not determine its new token from the refreshed preset list."
+        new_token = new_tokens[0]
+
+        if preset_name is not None:
+            new_preset = None
+            for candidate in camera.ptz.presets:
+                if candidate.token == new_token:
+                    new_preset = candidate
+                    break
+            new_preset.name = preset_name
+            set_preset(camera, profile_token, new_preset)
+            if camera.errors:
+                raise Exception(f"Preset {new_token} created, but failed to set its name: {camera.errors}")
+
+        name_note = f" named '{preset_name}'" if preset_name else ""
+        return f"Successfully created new preset {new_token}{name_note} on camera at {camera.xaddr}."
+
+    except Exception as e:
+        logger.error(f"Failed to set preset for camera at {camera.xaddr}: {e}")
+        return f"Failed to set preset for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
