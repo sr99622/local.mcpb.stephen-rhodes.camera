@@ -7,7 +7,7 @@ from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
-        get_time_offset, set_preset, get_presets
+        get_time_offset, set_preset, get_presets, remove_preset
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -459,6 +459,52 @@ async def set_camera_preset(json_string: str, profile_token: str, preset_token: 
     except Exception as e:
         logger.error(f"Failed to set preset for camera at {camera.xaddr}: {e}")
         return f"Failed to set preset for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def remove_camera_preset(json_string: str, profile_token: str, preset_token: str) -> str:
+    """
+    Permanently delete a PTZ preset from a camera.
+
+    This removes the preset entirely - it is not the same as clearing or
+    resetting a preset's position, and it cannot be undone from this
+    tool. If you want to reuse a preset's token/slot for a different
+    position instead of deleting it outright, use set_camera_preset in
+    overwrite mode instead.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        preset_token: Token of the preset to remove, from
+                      camera.ptz.presets in the same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    preset = None
+    for candidate in (camera.ptz.presets if camera.ptz else []):
+        if candidate.token == preset_token:
+            preset = candidate
+            break
+    if not preset:
+        return f"Preset {preset_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        remove_preset(camera, profile_token, preset)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully removed preset {preset_token} from camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to remove preset {preset_token} from camera at {camera.xaddr}: {e}")
+        return f"Failed to remove preset {preset_token} from camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
