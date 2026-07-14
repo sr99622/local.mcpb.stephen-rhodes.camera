@@ -7,7 +7,8 @@ from libonvif.utils.adapters import find_adapters
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
-        get_time_offset, set_preset, get_presets, remove_preset
+        get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
+        remove_preset_tour, operate_preset_tour, get_preset_tours
 from mcp.server.fastmcp import FastMCP
 import os
 import sys
@@ -505,6 +506,280 @@ async def remove_camera_preset(json_string: str, profile_token: str, preset_toke
     except Exception as e:
         logger.error(f"Failed to remove preset {preset_token} from camera at {camera.xaddr}: {e}")
         return f"Failed to remove preset {preset_token} from camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def create_camera_preset_tour(json_string: str, profile_token: str, tour_name: str = None) -> str:
+    """
+    Create a new, empty PTZ preset tour on a camera.
+
+    The underlying ONVIF CreatePresetTour operation has no name field, so
+    if tour_name is given, this tool creates the tour first, determines
+    the token the camera just assigned (by diffing camera.ptz.tours
+    before/after), then applies the name in a follow-up call - the tour
+    has no spots yet either way, so this is a safe two-step sequence, the
+    same pattern used by set_camera_preset for naming a newly-created
+    preset.
+
+    Once created, use set_camera_preset_tour to populate it with spots
+    (preset token + stay time pairs), then start_camera_preset_tour to
+    run it.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        tour_name: Optional name to assign to the new tour.
+
+    Returns:
+        A message indicating success or failure. On success, includes the
+        newly assigned tour token.
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    try:
+        camera.errors = None
+        existing_tokens = {t.token for t in (camera.ptz.tours if camera.ptz else [])}
+
+        create_preset_tour(camera, profile_token)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+
+        get_preset_tours(camera, profile_token)
+        if camera.errors:
+            raise Exception(f"Camera returned errors while refreshing tours: {camera.errors}")
+
+        new_tokens = [t.token for t in camera.ptz.tours if t.token not in existing_tokens]
+        if not new_tokens:
+            return f"Tour created on camera at {camera.xaddr}, but could not determine its new token from the refreshed tour list."
+        new_token = new_tokens[0]
+
+        if tour_name is not None:
+            new_tour = None
+            for candidate in camera.ptz.tours:
+                if candidate.token == new_token:
+                    new_tour = candidate
+                    break
+            new_tour.name = tour_name
+            modify_preset_tour(camera, profile_token, new_tour)
+            if camera.errors:
+                raise Exception(f"Tour {new_token} created, but failed to set its name: {camera.errors}")
+
+        name_note = f" named '{tour_name}'" if tour_name else ""
+        return f"Successfully created new preset tour {new_token}{name_note} on camera at {camera.xaddr}."
+
+    except Exception as e:
+        logger.error(f"Failed to create preset tour for camera at {camera.xaddr}: {e}")
+        return f"Failed to create preset tour for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def set_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+    """
+    Push a PTZ preset tour's full configuration - name, auto_start, and
+    spots - to a camera.
+
+    Like set_camera_video_encoder, this tool works directly on the
+    camera's JSON representation (as returned by get_camera or
+    get_cameras): edit whichever fields you want to change inside
+    ptz.tours[tour_token] in that JSON, then pass the edited JSON string
+    back in here. Every field currently set under that tour is pushed to
+    the camera in a single ONVIF call - this replaces the tour's entire
+    spot list with whatever is currently there, rather than adding to or
+    removing from it incrementally, so to add or remove a spot, edit the
+    full list to the desired end result before calling this.
+
+    Editable fields under ptz.tours[tour_token]:
+
+        name
+            Display name for the tour.
+
+        auto_start
+            Boolean. Whether the tour starts automatically under the
+            camera's own configured starting condition (see
+            ptz.tour_options.starting_condition), rather than needing to
+            be started manually via start_camera_preset_tour.
+
+        spots
+            A list of {preset_token, stay_time} pairs, in the order the
+            tour should visit them. preset_token must match a real
+            preset in camera.ptz.presets. stay_time is an ISO 8601
+            duration string (e.g. "PT5S" for 5 seconds) - check
+            ptz.tour_options.tour_spot.stay_time for the camera's allowed
+            min/max range, and ptz.tour_options.tour_spot.preset_tokens
+            for which presets are eligible to be used in a tour at all
+            (not every stored preset may qualify).
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras, with the
+                     desired changes already made under
+                     ptz.tours[tour_token].
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        tour_token: The token of the tour to update, from ptz.tours in
+                    the same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    tour = None
+    for candidate in (camera.ptz.tours if camera.ptz else []):
+        if candidate.token == tour_token:
+            tour = candidate
+            break
+    if not tour:
+        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        modify_preset_tour(camera, profile_token, tour)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully updated preset tour {tour_token} on camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to update preset tour {tour_token} on camera at {camera.xaddr}: {e}")
+        return f"Failed to update preset tour {tour_token} on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def remove_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+    """
+    Permanently delete a PTZ preset tour from a camera.
+
+    This removes the tour entirely - it does not affect the individual
+    presets used in its spots, only the tour itself - and cannot be
+    undone from this tool.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        tour_token: Token of the tour to remove, from ptz.tours in the
+                    same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    tour = None
+    for candidate in (camera.ptz.tours if camera.ptz else []):
+        if candidate.token == tour_token:
+            tour = candidate
+            break
+    if not tour:
+        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        remove_preset_tour(camera, profile_token, tour)
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully removed preset tour {tour_token} from camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to remove preset tour {tour_token} from camera at {camera.xaddr}: {e}")
+        return f"Failed to remove preset tour {tour_token} from camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def start_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+    """
+    Start running a PTZ preset tour on a camera.
+
+    The camera begins moving through the tour's spots in order, pausing
+    at each for its configured stay_time, looping continuously until
+    stop_camera_preset_tour is called. This does not wait for the tour to
+    complete (it never does, on its own) or confirm it started - check
+    ptz.tours[tour_token].status.state via a fresh get_camera call to see
+    its reported state (e.g. "Idle" vs actively touring).
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        tour_token: Token of the tour to start, from ptz.tours in the
+                    same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    tour = None
+    for candidate in (camera.ptz.tours if camera.ptz else []):
+        if candidate.token == tour_token:
+            tour = candidate
+            break
+    if not tour:
+        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        operate_preset_tour(camera, profile_token, tour, "Start")
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully started preset tour {tour_token} on camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to start preset tour {tour_token} on camera at {camera.xaddr}: {e}")
+        return f"Failed to start preset tour {tour_token} on camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
+async def stop_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+    """
+    Stop a running PTZ preset tour on a camera.
+
+    Args:
+        json_string: The JSON string representation of the camera, as
+                     returned by get_camera or get_cameras.
+        profile_token: The media profile token to command (almost always
+                       the main profile, e.g. profiles[0].token).
+        tour_token: Token of the tour to stop, from ptz.tours in the
+                    same JSON.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = camera_from_json(json_string)
+    except Exception as e:
+        logger.error(f"Failed to parse camera JSON: {e}")
+        return f"Failed to parse camera JSON: {e}"
+
+    tour = None
+    for candidate in (camera.ptz.tours if camera.ptz else []):
+        if candidate.token == tour_token:
+            tour = candidate
+            break
+    if not tour:
+        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+
+    try:
+        camera.errors = None
+        operate_preset_tour(camera, profile_token, tour, "Stop")
+        if camera.errors:
+            raise Exception(f"Camera returned errors: {camera.errors}")
+        return f"Successfully stopped preset tour {tour_token} on camera at {camera.xaddr}."
+    except Exception as e:
+        logger.error(f"Failed to stop preset tour {tour_token} on camera at {camera.xaddr}: {e}")
+        return f"Failed to stop preset tour {tour_token} on camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
 async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
