@@ -10,6 +10,8 @@ from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_host
         get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
         remove_preset_tour, operate_preset_tour, get_preset_tours
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
+from pydantic import BaseModel
 import os
 import sys
 import webbrowser
@@ -24,6 +26,9 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("camera")
 
 USER_AGENT = "camera-app/1.0"
+
+class TripTypeResponse(BaseModel):
+    value: str
 
 def get_camera_credentials(camera: Camera) -> None:
     camera.username = os.environ.get("CAMERA_USERNAME", "")
@@ -79,11 +84,24 @@ def grep_search(pattern, directory, fileExtension=None):
     return {"matches": results}
 
 @mcp.tool()
-async def example_async_tool() -> str:
+async def example_async_tool(context: Context) -> str:
     """
-    Example async tool that returns a simple message.
+    Example async tool that asks the user a question via MCP elicitation,
+    to experiment with the elicitation flow (server -> client -> user ->
+    client -> server) as a building block for eventually responding to
+    camera events interactively.
     """
-    return json.dumps({"message": "Hello from async tool!"}, indent=4)
+    result = await context.elicit(
+        message="What type of trip are you planning? Options: business, leisure, family, adventure",
+        schema=TripTypeResponse,
+    )
+    if isinstance(result, AcceptedElicitation):
+        return result.data.value
+    elif isinstance(result, DeclinedElicitation):
+        return "DECLINED"
+    elif isinstance(result, CancelledElicitation):
+        return "CANCELLED"
+    return "INVALID RESPONSE"
 
 @mcp.tool()
 async def get_camera_mcp_version() -> str:
