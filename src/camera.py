@@ -9,7 +9,7 @@ from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_host
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
         get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
         remove_preset_tour, operate_preset_tour, get_preset_tours
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 import os
 import sys
 import webbrowser
@@ -78,6 +78,12 @@ def grep_search(pattern, directory, fileExtension=None):
 
     return {"matches": results}
 
+@mcp.tool()
+async def example_async_tool() -> str:
+    """
+    Example async tool that returns a simple message.
+    """
+    return json.dumps({"message": "Hello from async tool!"}, indent=4)
 
 @mcp.tool()
 async def get_camera_mcp_version() -> str:
