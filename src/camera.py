@@ -1015,7 +1015,7 @@ async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
         return f"Failed to change hostname for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def sync_camera_time(json_string: str) -> str:
+async def sync_camera_time(ip_address: str) -> str:
     """
     Synchronize a camera's clock to this machine's current local time.
 
@@ -1024,26 +1024,27 @@ async def sync_camera_time(json_string: str) -> str:
     2000-01-01), which otherwise produces confusing timestamps on
     snapshots and event data.
 
-    Builds a SystemDateAndTime from this machine's current local and UTC
-    time (matching the timezone-offset format ONVIF expects), pushes it
-    to the camera, then re-queries the camera's own reported time to
-    recalculate time_offset - the difference in seconds between the
-    camera's clock and this machine's, which should end up close to zero
-    once synced.
+    This function queries the camera directly via ONVIF using its IP address
+    (with credentials from environment variables), builds a full Camera object,
+    synchronizes its clock, then re-queries to report the resulting time offset.
+    No JSON string payload is needed — just the camera's IP address.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to sync.
 
     Returns:
         A message indicating success or failure, including the resulting
         time_offset in seconds if successful.
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     try:
         camera.errors = None
