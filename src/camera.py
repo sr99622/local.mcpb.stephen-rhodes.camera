@@ -977,22 +977,31 @@ async def stop_camera_zoom(json_string: str, profile_token: str) -> str:
         return f"Failed to stop zoom move on camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def change_camera_hostname(json_string: str, new_hostname: str) -> str:
+async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
     """
-    Change the hostname of a camera.
+    Change the hostname of a camera by IP address.
+
+    This function queries the camera directly via ONVIF using its IP address
+    (with credentials from environment variables), builds a full Camera object,
+    and pushes the new hostname. No JSON string payload is needed — just the
+    camera's IP and the desired hostname.
 
     Args:
-        json_string: The JSON string representation of the camera, as returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to re-name.
         new_hostname: The new hostname to set.
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     try:
         camera.hostname.name = new_hostname
