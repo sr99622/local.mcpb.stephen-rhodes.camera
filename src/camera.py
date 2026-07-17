@@ -1237,10 +1237,10 @@ async def get_cameras() -> str:
 
     Each summary contains only the fields an agent typically needs to reason
     about — hostname, device info, profile tokens, encoder config (from the
-    first/primary profile), PTZ presets, tours, snapshot & stream URIs. All
-    the noisy ONVIF boilerplate (codec resolution lists, multicast settings,
-    SOAP addresses, network interface details, imaging options, etc.) is
-    stripped away.
+    first/primary profile), PTZ presets, tours, snapshot & stream URIs, and
+    time offset. All the noisy ONVIF boilerplate (codec resolution lists,
+    multicast settings, SOAP addresses, network interface details, imaging
+    options, etc.) is stripped away.
 
     Returns:
         A delimited string containing a summary dict for each camera found on
@@ -1362,6 +1362,12 @@ async def get_cameras() -> str:
         except Exception:
             pass
 
+        # --- Time offset (seconds between camera clock and this machine) ---
+        try:
+            time_offset = int(getattr(camera, "time_offset", 0) or 0)
+        except Exception:
+            time_offset = 0
+
         summary = {
             "hostname": hostname,
             "ip_address": ip_addr,
@@ -1372,7 +1378,8 @@ async def get_cameras() -> str:
             "profiles": profiles,
             "ptz_presets": presets,
             "ptz_tours": tours,
-            "ptz_status": ptz_st
+            "ptz_status": ptz_st,
+            "time_offset": time_offset
         }
         summaries.append(json.dumps(summary))
 
