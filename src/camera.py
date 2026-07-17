@@ -1035,6 +1035,14 @@ async def sync_camera_time(ip_address: str) -> str:
     Returns:
         A message indicating success or failure, including the resulting
         time_offset in seconds if successful.
+
+    Note: The returned time_offset value is used during ONVIF authentication.
+    Callers should save this new time_offset into their local camera JSON
+    summary (as returned by get_cameras) after a sync completes successfully,
+    otherwise future ONVIF calls to this camera may fail with timestamp-based
+    auth errors. The get_cameras tool reads time_offset from each discovered
+    camera at discovery time, so the saved value will be used for the next
+    sync_camera_time or other IP-address tool calls.
     """
     try:
         camera = get_camera_by_ip(
