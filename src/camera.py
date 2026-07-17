@@ -10,7 +10,7 @@ from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_host
         get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
         remove_preset_tour, operate_preset_tour, get_preset_tours
 from libonvif.datastructures.capabilities import Capabilities, PTZCapabilities
-from libonvif.datastructures.ptz import PTZPreset
+from libonvif.datastructures.ptz import PTZPreset, PresetTour
 from libonvif.utils.serialization import to_dict
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
@@ -735,87 +735,127 @@ async def start_camera_preset_tour(json_string: str, profile_token: str, tour_to
     """
     Start running a PTZ preset tour on a camera.
 
+    json_string is the abbreviated per-camera summary produced by
+    get_cameras (NOT the full camera representation) - this tool reads
+    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
+    minimal Camera object by hand, since that's all the underlying
+    libonvif call actually needs. Credentials come from the
+    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+
+    Tours are found at ptz_tours in that same summary - a list of
+    {token, name, status, spot_count} entries. Find the tour you want by
+    matching its token or name in that list, then pass its token here as
+    tour_token.
+
     The camera begins moving through the tour's spots in order, pausing
     at each for its configured stay_time, looping continuously until
     stop_camera_preset_tour is called. This does not wait for the tour to
     complete (it never does, on its own) or confirm it started - check
-    ptz.tours[tour_token].status.state via a fresh get_camera call to see
-    its reported state (e.g. "Idle" vs actively touring).
+    that tour's status field via a fresh get_cameras call to see its
+    reported state (e.g. "Idle" vs actively touring).
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        json_string: The abbreviated camera summary JSON string, as
+                     returned by get_cameras, containing at least
+                     ptz_xaddr and time_offset for this camera.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
-        tour_token: Token of the tour to start, from ptz.tours in the
-                    same JSON.
+        tour_token: Token of the tour to start, from ptz_tours in the
+                    same summary.
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        data = json.loads(json_string)
     except Exception as e:
         logger.error(f"Failed to parse camera JSON: {e}")
         return f"Failed to parse camera JSON: {e}"
 
-    tour = None
-    for candidate in (camera.ptz.tours if camera.ptz else []):
-        if candidate.token == tour_token:
-            tour = candidate
-            break
-    if not tour:
-        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+    ptz_xaddr = data.get("ptz_xaddr")
+    if not ptz_xaddr:
+        return (
+            "This camera summary is missing ptz_xaddr - call get_cameras "
+            "again to get an up to date summary before retrying."
+        )
+
+    camera = Camera()
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.username = os.environ.get("CAMERA_USERNAME", "")
+    camera.password = os.environ.get("CAMERA_PASSWORD", "")
+    camera.time_offset = data.get("time_offset", 0)
+
+    tour = PresetTour(token=tour_token)
 
     try:
         camera.errors = None
         operate_preset_tour(camera, profile_token, tour, "Start")
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully started preset tour {tour_token} on camera at {camera.xaddr}."
+        return f"Successfully started preset tour {tour_token} on camera at {ptz_xaddr}."
     except Exception as e:
-        logger.error(f"Failed to start preset tour {tour_token} on camera at {camera.xaddr}: {e}")
-        return f"Failed to start preset tour {tour_token} on camera at {camera.xaddr}: {e}"
+        logger.error(f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}")
+        return f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}"
 
 @mcp.tool()
 async def stop_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
     """
     Stop a running PTZ preset tour on a camera.
 
+    json_string is the abbreviated per-camera summary produced by
+    get_cameras (NOT the full camera representation) - this tool reads
+    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
+    minimal Camera object by hand, since that's all the underlying
+    libonvif call actually needs. Credentials come from the
+    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+
+    Tours are found at ptz_tours in that same summary - a list of
+    {token, name, status, spot_count} entries. Find the tour you want by
+    matching its token or name in that list, then pass its token here as
+    tour_token.
+
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        json_string: The abbreviated camera summary JSON string, as
+                     returned by get_cameras, containing at least
+                     ptz_xaddr and time_offset for this camera.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
-        tour_token: Token of the tour to stop, from ptz.tours in the
-                    same JSON.
+        tour_token: Token of the tour to stop, from ptz_tours in the
+                    same summary.
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        data = json.loads(json_string)
     except Exception as e:
         logger.error(f"Failed to parse camera JSON: {e}")
         return f"Failed to parse camera JSON: {e}"
 
-    tour = None
-    for candidate in (camera.ptz.tours if camera.ptz else []):
-        if candidate.token == tour_token:
-            tour = candidate
-            break
-    if not tour:
-        return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+    ptz_xaddr = data.get("ptz_xaddr")
+    if not ptz_xaddr:
+        return (
+            "This camera summary is missing ptz_xaddr - call get_cameras "
+            "again to get an up to date summary before retrying."
+        )
+
+    camera = Camera()
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.username = os.environ.get("CAMERA_USERNAME", "")
+    camera.password = os.environ.get("CAMERA_PASSWORD", "")
+    camera.time_offset = data.get("time_offset", 0)
+
+    tour = PresetTour(token=tour_token)
 
     try:
         camera.errors = None
         operate_preset_tour(camera, profile_token, tour, "Stop")
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully stopped preset tour {tour_token} on camera at {camera.xaddr}."
+        return f"Successfully stopped preset tour {tour_token} on camera at {ptz_xaddr}."
     except Exception as e:
-        logger.error(f"Failed to stop preset tour {tour_token} on camera at {camera.xaddr}: {e}")
-        return f"Failed to stop preset tour {tour_token} on camera at {camera.xaddr}: {e}"
+        logger.error(f"Failed to stop preset tour {tour_token} on camera at {ptz_xaddr}: {e}")
+        return f"Failed to stop preset tour {tour_token} on camera at {ptz_xaddr}: {e}"
 
 @mcp.tool()
 async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
