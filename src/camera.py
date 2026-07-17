@@ -1223,15 +1223,18 @@ async def update_camera_data(json_string: str) -> str:
 @mcp.tool()
 async def get_cameras() -> str:
     """
-    Get cameras on the local network.
-    
-    Args:
-        None
+    Discover cameras on the local network and return lightweight summaries.
+
+    Each summary contains only the fields an agent typically needs to reason
+    about — hostname, device info, profile tokens, encoder config (from the
+    first/primary profile), PTZ presets, tours, snapshot & stream URIs. All
+    the noisy ONVIF boilerplate (codec resolution lists, multicast settings,
+    SOAP addresses, network interface details, imaging options, etc.) is
+    stripped away.
 
     Returns:
-        A delimited string containing full camera information in json format 
-        for each camera found on the local network. Each camera's information 
-        is separated by "\n--\n".
+        A delimited string containing a summary dict for each camera found on
+        the local network. Each camera's summary is separated by "\n--\n".
     """
 
     ip_address = "0.0.0.0"
@@ -1246,14 +1249,125 @@ async def get_cameras() -> str:
                        on_error=on_error,
                        camera_filled=camera_filled,
                        use_threads=True)
-    
-    logger.debug(f"Found {len(cameras)} {"camera" if len(cameras) == 1 else "cameras"}")
 
-    names = []
+    logger.debug(f"Discovered {len(cameras)} camera(s)")
+
+    summaries = []
     for camera in cameras:
-        names.append(camera.to_json())
+        # --- Device information (dict-like or attribute-accessible) ---
+        dev = getattr(camera, "device_information", None)
+        if isinstance(dev, dict):
+            manufacturer = dev.get("manufacturer", "")
+            model = dev.get("model", "")
+            firmware = dev.get("firmware_version", "")
+            serial = dev.get("serial_number", "")
+        elif dev is not None:
+            manufacturer = getattr(dev, "manufacturer", "")
+            model = getattr(dev, "model", "")
+            firmware = getattr(dev, "firmware_version", "")
+            serial = getattr(dev, "serial_number", "")
+        else:
+            manufacturer = model = firmware = serial = ""
 
-    return "\n--\n".join(names)
+        # --- Hostname (libonvif may store as camera.hostname object or camera.name) ---
+        hostname = None
+        try:
+            hn = getattr(camera, "hostname", None)
+            if isinstance(hn, dict):
+                hostname = hn.get("name", "")
+            elif hn is not None:
+                hostname = str(getattr(hn, "name", hn))
+        except Exception:
+            pass
+        if not hostname:
+            hostname = str(getattr(camera, "name", ""))
+
+        # --- IP address derived from xaddr ---
+        ip_addr = ""
+        try:
+            xaddr = getattr(camera, "xaddr", "") or ""
+            if isinstance(xaddr, str) and "://" in xaddr:
+                ip_addr = xaddr.split("://", 1)[1].split("/", 1)[0]
+        except Exception:
+            pass
+
+        # --- Primary profile(s): token, encoder config, URIs ---
+        profiles = []
+        try:
+            cam_profiles = getattr(camera, "profiles", []) or []
+            for p in cam_profiles:
+                pe = getattr(p, "video_encoder", None)
+                rc = getattr(pe, "rate_control", None) if pe else None
+                profile_entry = {
+                    "token": getattr(p, "token", ""),
+                    "name": getattr(p, "name", ""),
+                    "video_encoder": {
+                        "encoding": getattr(pe, "encoding", "") if pe else "",
+                        "resolution": getattr(pe, "resolution", "") if pe else ""
+                    },
+                    "stream_uri": getattr(p, "stream_uri", "") or "",
+                    "snapshot_uri": getattr(p, "snapshot_uri", "") or ""
+                }
+                profiles.append(profile_entry)
+        except Exception:
+            pass
+
+        # --- PTZ presets (token + name only) ---
+        presets = []
+        try:
+            ptz_presets = getattr(getattr(camera, "ptz", None), "presets", []) or []
+            for pr in ptz_presets:
+                presets.append({
+                    "token": str(getattr(pr, "token", "")),
+                    "name": str(getattr(pr, "name", "") or "")
+                })
+        except Exception:
+            pass
+
+        # --- PTZ tours (token, name, status, spot count) ---
+        tours = []
+        try:
+            ptz_tours = getattr(getattr(camera, "ptz", None), "tours", []) or []
+            for t in ptz_tours:
+                status_obj = getattr(t, "status", None)
+                spots = getattr(t, "spots", [])
+                tours.append({
+                    "token": str(getattr(t, "token", "")),
+                    "name": str(getattr(t, "name", "") or ""),
+                    "status": str(getattr(status_obj, "state", "") if status_obj else ""),
+                    "spot_count": len(spots) if isinstance(spots, (list, tuple)) else 0
+                })
+        except Exception:
+            pass
+
+        # --- PTZ operational status ---
+        ptz_st = {"pan_tilt": "", "zoom": ""}
+        try:
+            ptz_obj = getattr(camera, "ptz", None)
+            if ptz_obj:
+                st = getattr(ptz_obj, "status", None)
+                if st:
+                    ptz_st["pan_tilt"] = str(getattr(st, "pan_tilt_status", ""))
+                    ptz_st["zoom"] = str(getattr(st, "zoom_status", ""))
+        except Exception:
+            pass
+
+        summary = {
+            "hostname": hostname,
+            "ip_address": ip_addr,
+            "manufacturer": manufacturer,
+            "model": model,
+            "firmware_version": firmware,
+            "serial_number": serial,
+            "profiles": profiles,
+            "ptz_presets": presets,
+            "ptz_tours": tours,
+            "ptz_status": ptz_st
+        }
+        summaries.append(json.dumps(summary))
+
+    return "\n--\n".join(summaries)
+
 
 def main():
     logger.debug("Server starting...")
