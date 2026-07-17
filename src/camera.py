@@ -10,7 +10,7 @@ from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_host
         get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
         remove_preset_tour, operate_preset_tour, get_preset_tours
 from libonvif.datastructures.capabilities import Capabilities, PTZCapabilities
-from libonvif.datastructures.ptz import PTZPreset, PresetTour
+from libonvif.datastructures.ptz import PTZPreset, PresetTour, TourSpot
 from libonvif.utils.serialization import to_dict
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
@@ -397,42 +397,47 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
         return f"Failed to move camera at {ptz_xaddr} to preset {preset_token}: {e}"
 
 @mcp.tool()
-async def set_camera_preset(json_string: str, profile_token: str, preset_token: str = None, preset_name: str = None) -> str:
+async def set_camera_preset(ip_address: str, profile_token: str, preset_token: str = None, preset_name: str = None) -> str:
     """
     Create a new PTZ preset, or overwrite an existing one with the camera's
     current position.
+
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, and edits it before pushing. No JSON payload is
+    needed - just the camera's IP address.
 
     Two modes, based on whether preset_token is supplied:
 
     - preset_token omitted (create mode): the camera creates a brand new
       preset at its current position. Cameras support a limited number of
-      presets - check how many already exist in camera.ptz.presets before
-      creating another, in case the camera silently rejects it once full.
-      If preset_name is given, the new preset is created first, then
-      renamed in a second call - the underlying ONVIF operation can't
-      assign a name to a preset that doesn't have a token yet, so this
-      tool creates it unnamed, determines the token the camera just
-      assigned, then renames it. The camera doesn't move between these
-      two calls, so the rename call safely re-saves the same position.
+      presets - check how many already exist (e.g. via get_cameras'
+      ptz_presets) before creating another, in case the camera silently
+      rejects it once full. If preset_name is given, the new preset is
+      created first, then renamed in a second call - the underlying ONVIF
+      operation can't assign a name to a preset that doesn't have a token
+      yet, so this tool creates it unnamed, determines the token the
+      camera just assigned, then renames it. The camera doesn't move
+      between these two calls, so the rename call safely re-saves the
+      same position.
 
     - preset_token supplied (overwrite mode): the preset matching that
-      token in camera.ptz.presets has its position overwritten to the
-      camera's CURRENT position - not restored to wherever it used to
-      point. If you only want to rename an existing preset without moving
-      it, first call goto_camera_preset to move the camera back to that
-      preset's own position, THEN call this tool - otherwise the preset's
-      saved position will be silently replaced with wherever the camera
-      happens to be sitting right now. Pass preset_name to also update the
-      preset's stored name at the same time.
+      token has its position overwritten to the camera's CURRENT
+      position - not restored to wherever it used to point. If you only
+      want to rename an existing preset without moving it, first call
+      goto_camera_preset to move the camera back to that preset's own
+      position, THEN call this tool - otherwise the preset's saved
+      position will be silently replaced with wherever the camera
+      happens to be sitting right now. Pass preset_name to also update
+      the preset's stored name at the same time.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to command.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
         preset_token: Token of an existing preset to overwrite (from
-                      camera.ptz.presets). Omit to create a new preset
-                      instead.
+                      get_cameras' ptz_presets). Omit to create a new
+                      preset instead.
         preset_name: Optional name to assign to the preset (new or
                      existing).
 
@@ -441,10 +446,14 @@ async def set_camera_preset(json_string: str, profile_token: str, preset_token: 
         includes the newly assigned preset token.
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     try:
         camera.errors = None
@@ -498,9 +507,14 @@ async def set_camera_preset(json_string: str, profile_token: str, preset_token: 
         return f"Failed to set preset for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def remove_camera_preset(json_string: str, profile_token: str, preset_token: str) -> str:
+async def remove_camera_preset(ip_address: str, profile_token: str, preset_token: str) -> str:
     """
     Permanently delete a PTZ preset from a camera.
+
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, and pushes the removal. No JSON payload is needed -
+    just the camera's IP address.
 
     This removes the preset entirely - it is not the same as clearing or
     resetting a preset's position, and it cannot be undone from this
@@ -509,21 +523,24 @@ async def remove_camera_preset(json_string: str, profile_token: str, preset_toke
     overwrite mode instead.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to command.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
-        preset_token: Token of the preset to remove, from
-                      camera.ptz.presets in the same JSON.
+        preset_token: Token of the preset to remove (from get_cameras'
+                      ptz_presets).
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     preset = None
     for candidate in (camera.ptz.presets if camera.ptz else []):
@@ -544,13 +561,18 @@ async def remove_camera_preset(json_string: str, profile_token: str, preset_toke
         return f"Failed to remove preset {preset_token} from camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def create_camera_preset_tour(json_string: str, profile_token: str, tour_name: str = None) -> str:
+async def create_camera_preset_tour(ip_address: str, profile_token: str, tour_name: str = None) -> str:
     """
     Create a new, empty PTZ preset tour on a camera.
 
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, and pushes the creation. No JSON payload is needed -
+    just the camera's IP address.
+
     The underlying ONVIF CreatePresetTour operation has no name field, so
     if tour_name is given, this tool creates the tour first, determines
-    the token the camera just assigned (by diffing camera.ptz.tours
+    the token the camera just assigned (by diffing the tour list
     before/after), then applies the name in a follow-up call - the tour
     has no spots yet either way, so this is a safe two-step sequence, the
     same pattern used by set_camera_preset for naming a newly-created
@@ -561,8 +583,7 @@ async def create_camera_preset_tour(json_string: str, profile_token: str, tour_n
     run it.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to command.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
         tour_name: Optional name to assign to the new tour.
@@ -572,10 +593,14 @@ async def create_camera_preset_tour(json_string: str, profile_token: str, tour_n
         newly assigned tour token.
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     try:
         camera.errors = None
@@ -613,60 +638,51 @@ async def create_camera_preset_tour(json_string: str, profile_token: str, tour_n
         return f"Failed to create preset tour for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def set_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+async def set_camera_preset_tour(ip_address: str, profile_token: str, tour_token: str, tour_name: str = None, auto_start: bool = None, spots: list[dict] = None) -> str:
     """
-    Push a PTZ preset tour's full configuration - name, auto_start, and
-    spots - to a camera.
+    Update a PTZ preset tour's name, auto_start, and/or spots on a camera.
 
-    Like set_camera_video_encoder, this tool works directly on the
-    camera's JSON representation (as returned by get_camera or
-    get_cameras): edit whichever fields you want to change inside
-    ptz.tours[tour_token] in that JSON, then pass the edited JSON string
-    back in here. Every field currently set under that tour is pushed to
-    the camera in a single ONVIF call - this replaces the tour's entire
-    spot list with whatever is currently there, rather than adding to or
-    removing from it incrementally, so to add or remove a spot, edit the
-    full list to the desired end result before calling this.
-
-    Editable fields under ptz.tours[tour_token]:
-
-        name
-            Display name for the tour.
-
-        auto_start
-            Boolean. Whether the tour starts automatically under the
-            camera's own configured starting condition (see
-            ptz.tour_options.starting_condition), rather than needing to
-            be started manually via start_camera_preset_tour.
-
-        spots
-            A list of {preset_token, stay_time} pairs, in the order the
-            tour should visit them. preset_token must match a real
-            preset in camera.ptz.presets. stay_time is an ISO 8601
-            duration string (e.g. "PT5S" for 5 seconds) - check
-            ptz.tour_options.tour_spot.stay_time for the camera's allowed
-            min/max range, and ptz.tour_options.tour_spot.preset_tokens
-            for which presets are eligible to be used in a tour at all
-            (not every stored preset may qualify).
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, applies whichever of tour_name/auto_start/spots you
+    supplied, then pushes the whole tour configuration in a single ONVIF
+    call. Arguments left as None (the default) keep the tour's current
+    value for that field - only supply the ones you actually want to
+    change. No JSON payload is needed - just the camera's IP address.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras, with the
-                     desired changes already made under
-                     ptz.tours[tour_token].
+        ip_address: The IP address of the camera to command.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
-        tour_token: The token of the tour to update, from ptz.tours in
-                    the same JSON.
+        tour_token: The token of the tour to update (from get_cameras'
+                    ptz_tours).
+        tour_name: Optional new display name for the tour.
+        auto_start: Optional new value for whether the tour starts
+                    automatically under the camera's own configured
+                    starting condition, rather than needing to be started
+                    manually via start_camera_preset_tour.
+        spots: Optional new list of stops for the tour, REPLACING its
+               entire current spot list (not additive) - to add or remove
+               a single spot, supply the full desired end-result list.
+               Each entry is a dict with:
+                 preset_token: must match a real preset (from
+                               get_cameras' ptz_presets).
+                 stay_time: an ISO 8601 duration string (e.g. "PT5S" for
+                            5 seconds).
+               e.g. [{"preset_token": "1", "stay_time": "PT5S"}, ...]
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     tour = None
     for candidate in (camera.ptz.tours if camera.ptz else []):
@@ -675,6 +691,16 @@ async def set_camera_preset_tour(json_string: str, profile_token: str, tour_toke
             break
     if not tour:
         return f"Tour {tour_token} not found on camera at {camera.xaddr}."
+
+    if tour_name is not None:
+        tour.name = tour_name
+    if auto_start is not None:
+        tour.auto_start = auto_start
+    if spots is not None:
+        tour.spots = [
+            TourSpot(preset_token=spot.get("preset_token"), stay_time=spot.get("stay_time"))
+            for spot in spots
+        ]
 
     try:
         camera.errors = None
@@ -687,30 +713,38 @@ async def set_camera_preset_tour(json_string: str, profile_token: str, tour_toke
         return f"Failed to update preset tour {tour_token} on camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def remove_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+async def remove_camera_preset_tour(ip_address: str, profile_token: str, tour_token: str) -> str:
     """
     Permanently delete a PTZ preset tour from a camera.
+
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, and pushes the removal. No JSON payload is needed -
+    just the camera's IP address.
 
     This removes the tour entirely - it does not affect the individual
     presets used in its spots, only the tour itself - and cannot be
     undone from this tool.
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        ip_address: The IP address of the camera to command.
         profile_token: The media profile token to command (almost always
                        the main profile, e.g. profiles[0].token).
-        tour_token: Token of the tour to remove, from ptz.tours in the
-                    same JSON.
+        tour_token: Token of the tour to remove (from get_cameras'
+                    ptz_tours).
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
     except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
 
     tour = None
     for candidate in (camera.ptz.tours if camera.ptz else []):
