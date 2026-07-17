@@ -9,6 +9,9 @@ from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_host
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
         get_time_offset, set_preset, get_presets, remove_preset, create_preset_tour, modify_preset_tour, \
         remove_preset_tour, operate_preset_tour, get_preset_tours
+from libonvif.datastructures.capabilities import Capabilities, PTZCapabilities
+from libonvif.datastructures.ptz import PTZPreset
+from libonvif.utils.serialization import to_dict
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation, CancelledElicitation
 from pydantic import BaseModel
@@ -329,11 +332,17 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
     """
     Move a PTZ camera to one of its stored presets.
 
-    Presets are found at camera.ptz.presets in the camera's JSON
-    representation (as returned by get_camera/get_cameras) - a list of
-    PTZPreset entries, each with a token and a (often blank) name. Find
-    the preset you want by matching its token or name in that list, then
-    pass its token here as preset_token.
+    json_string is the abbreviated per-camera summary produced by
+    get_cameras (NOT the full camera representation, and NOT run through
+    the generic JSON parser used elsewhere in this server) - this tool
+    reads exactly two fields out of it (ptz_xaddr, time_offset) and builds
+    a minimal Camera object by hand, since that's all the underlying
+    libonvif call actually needs. Credentials come from the
+    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+
+    Presets are found at ptz_presets in that same summary - a list of
+    {token, name} pairs. Find the preset you want by matching its token or
+    name in that list, then pass its token here as preset_token.
 
     profile_token should almost always be the camera's main media profile
     token - typically profiles[0].token, e.g. "MediaProfile000" - since
@@ -341,48 +350,51 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
     they're normally stored.
 
     This tool only sends the move command; it does not wait for the
-    camera to finish moving or confirm it arrived. To check on that,
-    call get_camera again afterward and look at ptz.status.pan_tilt_status
-    and ptz.status.zoom_status ("IDLE" once the move has completed) and
-    ptz.status.position for the camera's current position.
+    camera to finish moving or confirm it arrived. To check on that, call
+    get_cameras again afterward and look at that camera's ptz_status
+    field ("IDLE" once the move has completed).
 
     Args:
-        json_string: The JSON string representation of the camera, as
-                     returned by get_camera or get_cameras.
+        json_string: The abbreviated camera summary JSON string, as
+                     returned by get_cameras, containing at least
+                     ptz_xaddr and time_offset for this camera.
         profile_token: The media profile token to command (see above).
         preset_token: The token of the preset to move to, from
-                      camera.ptz.presets in the same JSON.
+                      ptz_presets in the same summary.
 
     Returns:
         A message indicating success or failure
     """
     try:
-        camera = camera_from_json(json_string)
+        data = json.loads(json_string)
     except Exception as e:
         logger.error(f"Failed to parse camera JSON: {e}")
         return f"Failed to parse camera JSON: {e}"
 
-    if not camera.ptz or not camera.ptz.presets:
-        return f"Camera at {camera.xaddr} has no PTZ presets available."
+    ptz_xaddr = data.get("ptz_xaddr")
+    if not ptz_xaddr:
+        return (
+            "This camera summary is missing ptz_xaddr - call get_cameras "
+            "again to get an up to date summary before retrying."
+        )
 
-    preset = None
-    for candidate in camera.ptz.presets:
-        if candidate.token == preset_token:
-            preset = candidate
-            break
+    camera = Camera()
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.username = os.environ.get("CAMERA_USERNAME", "")
+    camera.password = os.environ.get("CAMERA_PASSWORD", "")
+    camera.time_offset = data.get("time_offset", 0)
 
-    if not preset:
-        return f"Preset {preset_token} not found on camera at {camera.xaddr}."
+    preset = PTZPreset(token=preset_token)
 
     try:
         camera.errors = None
         goto_preset(camera, profile_token, preset)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully moved camera at {camera.xaddr} to preset {preset_token}."
+        return f"Successfully moved camera at {ptz_xaddr} to preset {preset_token}."
     except Exception as e:
-        logger.error(f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}")
-        return f"Failed to move camera at {camera.xaddr} to preset {preset_token}: {e}"
+        logger.error(f"Failed to move camera at {ptz_xaddr} to preset {preset_token}: {e}")
+        return f"Failed to move camera at {ptz_xaddr} to preset {preset_token}: {e}"
 
 @mcp.tool()
 async def set_camera_preset(json_string: str, profile_token: str, preset_token: str = None, preset_name: str = None) -> str:
@@ -1272,122 +1284,79 @@ async def get_cameras() -> str:
 
     summaries = []
     for camera in cameras:
-        # --- Device information (dict-like or attribute-accessible) ---
-        dev = getattr(camera, "device_information", None)
-        if isinstance(dev, dict):
-            manufacturer = dev.get("manufacturer", "")
-            model = dev.get("model", "")
-            firmware = dev.get("firmware_version", "")
-            serial = dev.get("serial_number", "")
-        elif dev is not None:
-            manufacturer = getattr(dev, "manufacturer", "")
-            model = getattr(dev, "model", "")
-            firmware = getattr(dev, "firmware_version", "")
-            serial = getattr(dev, "serial_number", "")
-        else:
-            manufacturer = model = firmware = serial = ""
-
-        # --- Hostname (libonvif may store as camera.hostname object or camera.name) ---
-        hostname = None
+        # Serialize once via the same codec used by Camera.to_json(), then
+        # project down to just the fields this summary needs. Every field
+        # below is read with `.get(key) or default` rather than
+        # `.get(key, default)`, since to_dict() always includes every
+        # dataclass field explicitly (even when its value is None) - the
+        # dict.get default only kicks in for a missing key, not a present
+        # key holding None, so relying on it here would silently produce
+        # None instead of the intended fallback.
         try:
-            hn = getattr(camera, "hostname", None)
-            if isinstance(hn, dict):
-                hostname = hn.get("name", "")
-            elif hn is not None:
-                hostname = str(getattr(hn, "name", hn))
-        except Exception:
-            pass
-        if not hostname:
-            hostname = str(getattr(camera, "name", ""))
+            data = to_dict(camera)
+        except Exception as e:
+            logger.error(f"Failed to serialize camera at {getattr(camera, 'xaddr', '?')}: {e}")
+            continue
 
-        # --- IP address derived from xaddr ---
-        ip_addr = ""
-        try:
-            xaddr = getattr(camera, "xaddr", "") or ""
-            if isinstance(xaddr, str) and "://" in xaddr:
-                ip_addr = xaddr.split("://", 1)[1].split("/", 1)[0]
-        except Exception:
-            pass
+        dev = data.get("device_information") or {}
+        hostname_obj = data.get("hostname") or {}
+        xaddr = data.get("xaddr") or ""
+        ip_addr = xaddr.split("://", 1)[1].split("/", 1)[0] if "://" in xaddr else ""
 
-        # --- Primary profile(s): token, encoder config, URIs ---
         profiles = []
-        try:
-            cam_profiles = getattr(camera, "profiles", []) or []
-            for p in cam_profiles:
-                pe = getattr(p, "video_encoder", None)
-                rc = getattr(pe, "rate_control", None) if pe else None
-                profile_entry = {
-                    "token": getattr(p, "token", ""),
-                    "name": getattr(p, "name", ""),
-                    "video_encoder": {
-                        "encoding": getattr(pe, "encoding", "") if pe else "",
-                        "resolution": getattr(pe, "resolution", "") if pe else ""
-                    },
-                    "stream_uri": getattr(p, "stream_uri", "") or "",
-                    "snapshot_uri": getattr(p, "snapshot_uri", "") or ""
-                }
-                profiles.append(profile_entry)
-        except Exception:
-            pass
+        for p in data.get("profiles") or []:
+            encoder = p.get("video_encoder") or {}
+            profiles.append({
+                "token": p.get("token") or "",
+                "name": p.get("name") or "",
+                "video_encoder": {
+                    "encoding": encoder.get("encoding") or "",
+                    "resolution": encoder.get("resolution") or ""
+                },
+                "stream_uri": p.get("stream_uri") or "",
+                "snapshot_uri": p.get("snapshot_uri") or ""
+            })
 
-        # --- PTZ presets (token + name only) ---
-        presets = []
-        try:
-            ptz_presets = getattr(getattr(camera, "ptz", None), "presets", []) or []
-            for pr in ptz_presets:
-                presets.append({
-                    "token": str(getattr(pr, "token", "")),
-                    "name": str(getattr(pr, "name", "") or "")
-                })
-        except Exception:
-            pass
+        ptz = data.get("ptz") or {}
 
-        # --- PTZ tours (token, name, status, spot count) ---
+        presets = [
+            {"token": pr.get("token") or "", "name": pr.get("name") or ""}
+            for pr in ptz.get("presets") or []
+        ]
+
         tours = []
-        try:
-            ptz_tours = getattr(getattr(camera, "ptz", None), "tours", []) or []
-            for t in ptz_tours:
-                status_obj = getattr(t, "status", None)
-                spots = getattr(t, "spots", [])
-                tours.append({
-                    "token": str(getattr(t, "token", "")),
-                    "name": str(getattr(t, "name", "") or ""),
-                    "status": str(getattr(status_obj, "state", "") if status_obj else ""),
-                    "spot_count": len(spots) if isinstance(spots, (list, tuple)) else 0
-                })
-        except Exception:
-            pass
+        for t in ptz.get("tours") or []:
+            tour_status = t.get("status") or {}
+            tours.append({
+                "token": t.get("token") or "",
+                "name": t.get("name") or "",
+                "status": tour_status.get("state") or "",
+                "spot_count": len(t.get("spots") or [])
+            })
 
-        # --- PTZ operational status ---
-        ptz_st = {"pan_tilt": "", "zoom": ""}
-        try:
-            ptz_obj = getattr(camera, "ptz", None)
-            if ptz_obj:
-                st = getattr(ptz_obj, "status", None)
-                if st:
-                    ptz_st["pan_tilt"] = str(getattr(st, "pan_tilt_status", ""))
-                    ptz_st["zoom"] = str(getattr(st, "zoom_status", ""))
-        except Exception:
-            pass
+        ptz_status = ptz.get("status") or {}
+        ptz_st = {
+            "pan_tilt": ptz_status.get("pan_tilt_status") or "",
+            "zoom": ptz_status.get("zoom_status") or ""
+        }
 
-        # --- Time offset (seconds between camera clock and this machine) ---
-        try:
-            time_offset = int(getattr(camera, "time_offset", 0) or 0)
-        except Exception:
-            time_offset = 0
+        caps = data.get("capabilities") or {}
+        ptz_caps = caps.get("ptz") or {}
+        ptz_xaddr = ptz_caps.get("xaddr") or ""
 
         summary = {
-            "hostname": hostname,
+            "hostname": hostname_obj.get("name") or data.get("name") or "",
             "ip_address": ip_addr,
-            "manufacturer": manufacturer,
-            "model": model,
-            "firmware_version": firmware,
-            "serial_number": serial,
+            "manufacturer": dev.get("manufacturer") or "",
+            "model": dev.get("model") or "",
+            "firmware_version": dev.get("firmware_version") or "",
+            "serial_number": dev.get("serial_number") or "",
             "profiles": profiles,
             "ptz_presets": presets,
             "ptz_tours": tours,
             "ptz_status": ptz_st,
-            "time_offset": time_offset
+            "ptz_xaddr": ptz_xaddr,
+            "time_offset": int(data.get("time_offset") or 0)
         }
         summaries.append(json.dumps(summary))
 

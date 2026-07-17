@@ -5,7 +5,7 @@ import logging
 from libonvif.devices.camera import Camera, discover
 from libonvif.utils.adapters import find_adapters
 import niquests as requests
-from camera import get_camera_mcp_version, set_camera_profile_resolution, get_cameras, get_camera
+from camera import get_camera_mcp_version, get_cameras, get_camera
 
 from niquests.auth import HTTPDigestAuth
 
@@ -51,12 +51,14 @@ def iterate_cameras_and_get_snapshots():
             else:
                 logger.error(f"Failed to access the camera snapshot. Status code: {response.status_code}")
 
+'''
 def set_camera_resolution():
     logger.debug("Setting camera resolution...")
     # Example values for testing
     ip_address = "10.1.1.78"
     profile_token = "MediaProfile000"
     return set_camera_profile_resolution(ip_address, profile_token, 1280, 720)
+'''
 
 async def main() -> None:
     logger.debug("Starting main function...")
