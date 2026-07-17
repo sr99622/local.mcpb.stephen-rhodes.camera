@@ -769,6 +769,17 @@ async def start_camera_preset_tour(json_string: str, profile_token: str, tour_to
     """
     Start running a PTZ preset tour on a camera.
 
+    IMPORTANT: to stop this tour later, stop_camera_preset_tour needs the
+    EXACT SAME profile_token and tour_token used here. Remember or store
+    both values now, at the time you call this - do not try to guess,
+    reconstruct, or leave either one blank when calling
+    stop_camera_preset_tour later. profile_token is not read from the
+    camera or validated against anything; if you pass a wrong or missing
+    value when stopping, the camera will reject the request with an error
+    like "Profile token does not exist", which is NOT a sign of a timing,
+    authentication, or clock-sync problem - it means the profile_token
+    value itself was wrong on that call.
+
     json_string is the abbreviated per-camera summary produced by
     get_cameras (NOT the full camera representation) - this tool reads
     exactly two fields out of it (ptz_xaddr, time_offset) and builds a
@@ -793,9 +804,12 @@ async def start_camera_preset_tour(json_string: str, profile_token: str, tour_to
                      returned by get_cameras, containing at least
                      ptz_xaddr and time_offset for this camera.
         profile_token: The media profile token to command (almost always
-                       the main profile, e.g. profiles[0].token).
+                       the main profile, e.g. profiles[0].token). Retain
+                       this exact value for the matching
+                       stop_camera_preset_tour call.
         tour_token: Token of the tour to start, from ptz_tours in the
-                    same summary.
+                    same summary. Retain this exact value for the
+                    matching stop_camera_preset_tour call.
 
     Returns:
         A message indicating success or failure
@@ -836,6 +850,19 @@ async def stop_camera_preset_tour(json_string: str, profile_token: str, tour_tok
     """
     Stop a running PTZ preset tour on a camera.
 
+    IMPORTANT: profile_token and tour_token here must be the EXACT SAME
+    values used in the start_camera_preset_tour call that started this
+    tour. Neither value is read from the camera or validated against
+    anything - if either is wrong, missing, or reconstructed from memory
+    incorrectly, the camera will reject this request with an error like
+    "Profile token does not exist". That error means the profile_token
+    value itself was wrong on THIS call - it is NOT a sign of a timing,
+    authentication, or clock-sync problem, and re-syncing time or
+    fetching a fresher camera JSON will not fix it. If you no longer have
+    the exact values from when the tour was started, get profile_token
+    from that camera's profiles[0].token and tour_token by matching the
+    tour's name in a fresh get_cameras call.
+
     json_string is the abbreviated per-camera summary produced by
     get_cameras (NOT the full camera representation) - this tool reads
     exactly two fields out of it (ptz_xaddr, time_offset) and builds a
@@ -852,10 +879,12 @@ async def stop_camera_preset_tour(json_string: str, profile_token: str, tour_tok
         json_string: The abbreviated camera summary JSON string, as
                      returned by get_cameras, containing at least
                      ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (almost always
-                       the main profile, e.g. profiles[0].token).
+        profile_token: The media profile token to command - must exactly
+                       match the value used in the start_camera_preset_tour
+                       call for this tour.
         tour_token: Token of the tour to stop, from ptz_tours in the
-                    same summary.
+                    same summary - must exactly match the value used in
+                    the start_camera_preset_tour call for this tour.
 
     Returns:
         A message indicating success or failure
