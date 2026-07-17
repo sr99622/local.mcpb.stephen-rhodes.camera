@@ -1364,10 +1364,6 @@ async def get_cameras() -> str:
 
         # --- Time offset (seconds between camera clock and this machine) ---
         try:
-            get_time_offset(camera)
-        except Exception:
-            pass
-        try:
             time_offset = int(getattr(camera, "time_offset", 0) or 0)
         except Exception:
             time_offset = 0
