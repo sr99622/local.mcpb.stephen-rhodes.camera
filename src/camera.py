@@ -840,7 +840,7 @@ async def start_camera_preset_tour(json_string: str, profile_token: str, tour_to
         operate_preset_tour(camera, profile_token, tour, "Start")
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully started preset tour {tour_token} on camera at {ptz_xaddr}."
+        return f"Successfully started preset tour token {tour_token} on media profile token {profile_token} for camera using ptz.xaddr {ptz_xaddr}, please retain these values for stopping the tour."
     except Exception as e:
         logger.error(f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}")
         return f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}"
