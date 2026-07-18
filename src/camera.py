@@ -242,6 +242,56 @@ async def set_camera_video_frame_rate(ip_address: str, profile_token: str, frame
         return f"Failed to set frame rate limit for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
+async def set_camera_video_bitrate(ip_address: str, profile_token: str, bitrate_limit: int) -> str:
+    """
+    Set the video bitrate limit for one media profile on a camera.
+
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, sets the bitrate limit on that profile's
+    video_encoder.rate_control, then pushes the whole encoder
+    configuration back to the camera in one ONVIF call. No JSON payload
+    is needed - just the camera's IP address.
+
+    Args:
+        ip_address: The IP address of the camera to command.
+        profile_token: The media profile token whose video_encoder should
+                       be pushed to the camera.
+        bitrate_limit: Integer kilobits per second. Must fall within the
+                    camera-reported valid bitrate range for this
+                    profile's current encoding.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
+    except Exception as e:
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
+
+    try:
+        camera.errors = None
+
+        for profile in camera.profiles:
+            if profile.token == profile_token:
+                profile.video_encoder.rate_control.bitrate_limit = bitrate_limit
+                set_video_encoder_configuration(camera, profile.video_encoder)
+                if camera.errors:
+                    raise Exception(f"Camera returned errors: {camera.errors}")
+                return f"Successfully set bitrate limit to {bitrate_limit} for camera at {camera.xaddr}, profile {profile_token}."
+
+        return f"Profile {profile_token} not found on camera at {camera.xaddr}."
+
+    except Exception as e:
+        logger.error(f"Failed to set bitrate limit for camera at {camera.xaddr}: {e}")
+        return f"Failed to set bitrate limit for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
 async def set_camera_audio_encoder(json_string: str, profile_token: str) -> str:
     """
     Push the audio_encoder configuration for one media profile to a camera.
