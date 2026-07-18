@@ -1572,17 +1572,22 @@ async def get_cameras() -> str:
 
         profiles = []
         for p in data.get("profiles") or []:
-            encoder = p.get("video_encoder") or {}
-            rate_control = encoder.get("rate_control") or {}
+            video_encoder = p.get("video_encoder") or {}
+            rate_control = video_encoder.get("rate_control") or {}
+            audio_encoder = p.get("audio_encdder") or {}
             profiles.append({
                 "token": p.get("token") or "",
                 "name": p.get("name") or "",
                 "video_encoder": {
-                    "encoding": encoder.get("encoding") or "",
-                    "resolution": encoder.get("resolution") or "",
+                    "encoding": video_encoder.get("encoding") or "",
+                    "resolution": video_encoder.get("resolution") or "",
                     "frame_rate_limit": rate_control.get("frame_rate_limit") or 0,
                     "bitrate_limit": rate_control.get("bitrate_limit") or 0,
-                    "gov_length": encoder.get("gov_length") or 0
+                    "gov_length": video_encoder.get("gov_length") or 0
+                },
+                "audio_encoder": {
+                    "encoding": audio_encoder.get("encoding") or "",
+                    "sample_rate": audio_encoder.get("sample_rate") or 0
                 },
                 "stream_uri": p.get("stream_uri") or "",
                 "snapshot_uri": p.get("snapshot_uri") or ""
