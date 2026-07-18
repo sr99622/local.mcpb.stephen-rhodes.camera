@@ -765,32 +765,34 @@ async def remove_camera_preset_tour(ip_address: str, profile_token: str, tour_to
         return f"Failed to remove preset tour {tour_token} from camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def start_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+async def start_camera_preset_tour(camera_ptz_xaddr: str, camera_profile_token: str, camera_ptz_tour_token: str, camera_time_offset: int) -> str:
     """
     Start running a PTZ preset tour on a camera.
 
     IMPORTANT: to stop this tour later, stop_camera_preset_tour needs the
-    EXACT SAME profile_token and tour_token used here. Remember or store
-    both values now, at the time you call this - do not try to guess,
-    reconstruct, or leave either one blank when calling
-    stop_camera_preset_tour later. profile_token is not read from the
-    camera or validated against anything; if you pass a wrong or missing
-    value when stopping, the camera will reject the request with an error
-    like "Profile token does not exist", which is NOT a sign of a timing,
-    authentication, or clock-sync problem - it means the profile_token
-    value itself was wrong on that call.
+    EXACT SAME camera_ptz_xaddr, camera_profile_token, and
+    camera_ptz_tour_token used here. The success message from this call
+    echoes all four argument values back to you in plain text - copy them
+    directly from that message into the matching stop_camera_preset_tour
+    call rather than trying to recall or reconstruct them later. None of
+    these values are read from the camera or validated against anything;
+    if any is wrong or missing when stopping, the camera will reject the
+    request with an error like "Profile token does not exist", which is
+    NOT a sign of a timing, authentication, or clock-sync problem - it
+    means one of these argument values was wrong on that call.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These four values come from the abbreviated per-camera summary
+    produced by get_cameras (NOT the full camera representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+      camera_ptz_tour_token <- the token of the desired entry in that
+                               camera's ptz_tours list
 
-    Tours are found at ptz_tours in that same summary - a list of
-    {token, name, status, spot_count} entries. Find the tour you want by
-    matching its token or name in that list, then pass its token here as
-    tour_token.
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     The camera begins moving through the tour's spots in order, pausing
     at each for its configured stay_time, looping continuously until
@@ -800,125 +802,110 @@ async def start_camera_preset_tour(json_string: str, profile_token: str, tour_to
     reported state (e.g. "Idle" vs actively touring).
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (almost always
-                       the main profile, e.g. profiles[0].token). Retain
-                       this exact value for the matching
-                       stop_camera_preset_tour call.
-        tour_token: Token of the tour to start, from ptz_tours in the
-                    same summary. Retain this exact value for the
-                    matching stop_camera_preset_tour call.
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (almost
+                       always the main profile, e.g. profiles[0].token).
+        camera_ptz_tour_token: Token of the tour to start, from that
+                       camera's ptz_tours in get_cameras.
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds), from get_cameras.
 
     Returns:
-        A message indicating success or failure
+        A message indicating success or failure. On success, echoes back
+        all four argument values for you to reuse in the matching
+        stop_camera_preset_tour call.
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
-    tour = PresetTour(token=tour_token)
+    tour = PresetTour(token=camera_ptz_tour_token)
 
     try:
         camera.errors = None
-        operate_preset_tour(camera, profile_token, tour, "Start")
+        operate_preset_tour(camera, camera_profile_token, tour, "Start")
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully started preset tour token {tour_token} on media profile token {profile_token} for camera using ptz.xaddr {ptz_xaddr}, please retain these values for stopping the tour."
+        return (
+            f"Successfully started preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}. "
+            f"To stop it later, call stop_camera_preset_tour with these exact values: "
+            f"camera_ptz_xaddr='{camera_ptz_xaddr}', camera_profile_token='{camera_profile_token}', "
+            f"camera_ptz_tour_token='{camera_ptz_tour_token}', camera_time_offset={camera_time_offset}."
+        )
     except Exception as e:
-        logger.error(f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}")
-        return f"Failed to start preset tour {tour_token} on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to start preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to start preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
-async def stop_camera_preset_tour(json_string: str, profile_token: str, tour_token: str) -> str:
+async def stop_camera_preset_tour(camera_ptz_xaddr: str, camera_profile_token: str, camera_ptz_tour_token: str, camera_time_offset: int) -> str:
     """
     Stop a running PTZ preset tour on a camera.
 
-    IMPORTANT: profile_token and tour_token here must be the EXACT SAME
-    values used in the start_camera_preset_tour call that started this
-    tour. Neither value is read from the camera or validated against
-    anything - if either is wrong, missing, or reconstructed from memory
-    incorrectly, the camera will reject this request with an error like
-    "Profile token does not exist". That error means the profile_token
-    value itself was wrong on THIS call - it is NOT a sign of a timing,
-    authentication, or clock-sync problem, and re-syncing time or
-    fetching a fresher camera JSON will not fix it. If you no longer have
-    the exact values from when the tour was started, get profile_token
-    from that camera's profiles[0].token and tour_token by matching the
+    IMPORTANT: camera_ptz_xaddr, camera_profile_token, and
+    camera_ptz_tour_token here must be the EXACT SAME values used in the
+    start_camera_preset_tour call that started this tour - that call's
+    success message echoed all four values back to you in plain text
+    specifically so you could copy them directly into this call. None of
+    these values are read from the camera or validated against anything -
+    if any is wrong, missing, or reconstructed from memory incorrectly,
+    the camera will reject this request with an error like "Profile
+    token does not exist". That error means one of these argument values
+    was wrong on THIS call - it is NOT a sign of a timing, authentication,
+    or clock-sync problem, and re-syncing time or fetching a fresher
+    camera JSON will not fix it. If you no longer have the exact values
+    from when the tour was started, get camera_profile_token from that
+    camera's profiles[0].token and camera_ptz_tour_token by matching the
     tour's name in a fresh get_cameras call.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
-
-    Tours are found at ptz_tours in that same summary - a list of
-    {token, name, status, spot_count} entries. Find the tour you want by
-    matching its token or name in that list, then pass its token here as
-    tour_token.
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command - must exactly
-                       match the value used in the start_camera_preset_tour
-                       call for this tour.
-        tour_token: Token of the tour to stop, from ptz_tours in the
-                    same summary - must exactly match the value used in
-                    the start_camera_preset_tour call for this tour.
+        camera_ptz_xaddr: Must exactly match the value used in the
+                       start_camera_preset_tour call for this tour.
+        camera_profile_token: Must exactly match the value used in the
+                       start_camera_preset_tour call for this tour.
+        camera_ptz_tour_token: Must exactly match the value used in the
+                       start_camera_preset_tour call for this tour.
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds) - a fresh value from get_cameras is
+                       fine here even if it differs slightly from the
+                       value used at start time.
 
     Returns:
         A message indicating success or failure
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
-    tour = PresetTour(token=tour_token)
+    tour = PresetTour(token=camera_ptz_tour_token)
 
     try:
         camera.errors = None
-        operate_preset_tour(camera, profile_token, tour, "Stop")
+        operate_preset_tour(camera, camera_profile_token, tour, "Stop")
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully stopped preset tour {tour_token} on camera at {ptz_xaddr}."
+        return f"Successfully stopped preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}."
     except Exception as e:
-        logger.error(f"Failed to stop preset tour {tour_token} on camera at {ptz_xaddr}: {e}")
-        return f"Failed to stop preset tour {tour_token} on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to stop preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to stop preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
 async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
