@@ -328,26 +328,22 @@ async def set_camera_audio_encoder(json_string: str, profile_token: str) -> str:
         return f"Failed to set audio encoder configuration for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
-async def goto_camera_preset(json_string: str, profile_token: str, preset_token: str) -> str:
+async def goto_camera_preset(camera_ptz_xaddr: str, camera_profile_token: str, camera_preset_token: str, camera_time_offset: int) -> str:
     """
     Move a PTZ camera to one of its stored presets.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation, and NOT run through
-    the generic JSON parser used elsewhere in this server) - this tool
-    reads exactly two fields out of it (ptz_xaddr, time_offset) and builds
-    a minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These four values come from the abbreviated per-camera summary
+    produced by get_cameras (NOT the full camera representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+      camera_preset_token <- the token of the desired entry in that
+                             camera's ptz_presets list
 
-    Presets are found at ptz_presets in that same summary - a list of
-    {token, name} pairs. Find the preset you want by matching its token or
-    name in that list, then pass its token here as preset_token.
-
-    profile_token should almost always be the camera's main media profile
-    token - typically profiles[0].token, e.g. "MediaProfile000" - since
-    PTZ presets are defined per-profile and the main profile is where
-    they're normally stored.
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     This tool only sends the move command; it does not wait for the
     camera to finish moving or confirm it arrived. To check on that, call
@@ -355,46 +351,40 @@ async def goto_camera_preset(json_string: str, profile_token: str, preset_token:
     field ("IDLE" once the move has completed).
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (see above).
-        preset_token: The token of the preset to move to, from
-                      ptz_presets in the same summary.
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (almost
+                       always the main profile, e.g. profiles[0].token).
+        camera_preset_token: The token of the preset to move to, from
+                       that camera's ptz_presets in get_cameras.
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds), from get_cameras.
 
     Returns:
         A message indicating success or failure
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
-    preset = PTZPreset(token=preset_token)
+    preset = PTZPreset(token=camera_preset_token)
 
     try:
         camera.errors = None
-        goto_preset(camera, profile_token, preset)
+        goto_preset(camera, camera_profile_token, preset)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully moved camera at {ptz_xaddr} to preset {preset_token}."
+        return f"Successfully moved camera at {camera_ptz_xaddr} to preset {camera_preset_token}."
     except Exception as e:
-        logger.error(f"Failed to move camera at {ptz_xaddr} to preset {preset_token}: {e}")
-        return f"Failed to move camera at {ptz_xaddr} to preset {preset_token}: {e}"
+        logger.error(f"Failed to move camera at {camera_ptz_xaddr} to preset {camera_preset_token}: {e}")
+        return f"Failed to move camera at {camera_ptz_xaddr} to preset {camera_preset_token}: {e}"
 
 @mcp.tool()
 async def set_camera_preset(ip_address: str, profile_token: str, preset_token: str = None, preset_name: str = None) -> str:
@@ -908,16 +898,20 @@ async def stop_camera_preset_tour(camera_ptz_xaddr: str, camera_profile_token: s
         return f"Failed to stop preset tour {camera_ptz_tour_token} on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
-async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: float) -> str:
+async def pan_tilt_camera(camera_ptz_xaddr: str, camera_profile_token: str, camera_time_offset: int, x: float, y: float) -> str:
     """
     Start a continuous pan/tilt move on a PTZ camera.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These three values come from the abbreviated per-camera summary
+    produced by get_cameras (NOT the full camera representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     x and y are normalized velocities in the range -1.0 to 1.0 (0.0 means
     no motion on that axis): positive x pans right, negative x pans left;
@@ -938,57 +932,54 @@ async def pan_tilt_camera(json_string: str, profile_token: str, x: float, y: flo
     at a time.
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (almost always
-                       the main profile, e.g. profiles[0].token).
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (almost
+                       always the main profile, e.g. profiles[0].token).
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds), from get_cameras.
         x: Pan velocity, -1.0 (left) to 1.0 (right). 0.0 for no pan.
         y: Tilt velocity, -1.0 (down) to 1.0 (up). 0.0 for no tilt.
 
     Returns:
         A message indicating success or failure
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
     try:
         camera.errors = None
-        continuous_move(camera, profile_token, x, y, 0)
+        continuous_move(camera, camera_profile_token, x, y, 0)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully started pan/tilt move on camera at {ptz_xaddr} (x={x}, y={y})."
+        return f"Successfully started pan/tilt move on camera at {camera_ptz_xaddr} (x={x}, y={y})."
     except Exception as e:
-        logger.error(f"Failed to start pan/tilt move on camera at {ptz_xaddr}: {e}")
-        return f"Failed to start pan/tilt move on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to start pan/tilt move on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to start pan/tilt move on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
-async def zoom_camera(json_string: str, profile_token: str, z: float) -> str:
+async def zoom_camera(camera_ptz_xaddr: str, camera_profile_token: str, camera_time_offset: int, z: float) -> str:
     """
     Start a continuous zoom move on a PTZ camera.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These three values come from the abbreviated per-camera summary
+    produced by get_cameras (NOT the full camera representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     z is a normalized velocity in the range -1.0 to 1.0, excluding 0.0:
     positive zooms in (telephoto), negative zooms out (wide). This is a
@@ -1010,11 +1001,11 @@ async def zoom_camera(json_string: str, profile_token: str, z: float) -> str:
     zoom at a time.
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (almost always
-                       the main profile, e.g. profiles[0].token).
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (almost
+                       always the main profile, e.g. profiles[0].token).
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds), from get_cameras.
         z: Zoom velocity, -1.0 (zoom out) to 1.0 (zoom in). Must not be 0.0.
 
     Returns:
@@ -1023,144 +1014,138 @@ async def zoom_camera(json_string: str, profile_token: str, z: float) -> str:
     if z == 0:
         return "z must not be 0.0 - to stop an in-progress zoom, call stop_camera_zoom instead."
 
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
     try:
         camera.errors = None
-        continuous_move(camera, profile_token, 0, 0, z)
+        continuous_move(camera, camera_profile_token, 0, 0, z)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully started zoom move on camera at {ptz_xaddr} (z={z})."
+        return f"Successfully started zoom move on camera at {camera_ptz_xaddr} (z={z})."
     except Exception as e:
-        logger.error(f"Failed to start zoom move on camera at {ptz_xaddr}: {e}")
-        return f"Failed to start zoom move on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to start zoom move on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to start zoom move on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
-async def stop_camera_pan_tilt(json_string: str, profile_token: str) -> str:
+async def stop_camera_pan_tilt(camera_ptz_xaddr: str, camera_profile_token: str, camera_time_offset: int) -> str:
     """
     Stop an in-progress continuous pan/tilt move started by pan_tilt_camera.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These three values must match what was used in the pan_tilt_camera
+    call that started the move - they come from the abbreviated
+    per-camera summary produced by get_cameras (NOT the full camera
+    representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     Has no effect on zoom - use stop_camera_zoom to stop a zoom move. If no
     pan/tilt move is currently in progress, this is a harmless no-op on
     most cameras.
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (should match
-                       whatever was used in the pan_tilt_camera call).
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (should
+                       match whatever was used in the pan_tilt_camera call).
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds) - a fresh value from get_cameras is
+                       fine here even if it differs slightly from the
+                       value used when the move was started.
 
     Returns:
         A message indicating success or failure
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
     try:
         camera.errors = None
-        move_stop(camera, profile_token, is_zoom=False)
+        move_stop(camera, camera_profile_token, is_zoom=False)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully stopped pan/tilt move on camera at {ptz_xaddr}."
+        return f"Successfully stopped pan/tilt move on camera at {camera_ptz_xaddr}."
     except Exception as e:
-        logger.error(f"Failed to stop pan/tilt move on camera at {ptz_xaddr}: {e}")
-        return f"Failed to stop pan/tilt move on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to stop pan/tilt move on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to stop pan/tilt move on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
-async def stop_camera_zoom(json_string: str, profile_token: str) -> str:
+async def stop_camera_zoom(camera_ptz_xaddr: str, camera_profile_token: str, camera_time_offset: int) -> str:
     """
     Stop an in-progress continuous zoom move started by zoom_camera.
 
-    json_string is the abbreviated per-camera summary produced by
-    get_cameras (NOT the full camera representation) - this tool reads
-    exactly two fields out of it (ptz_xaddr, time_offset) and builds a
-    minimal Camera object by hand, since that's all the underlying
-    libonvif call actually needs. Credentials come from the
-    CAMERA_USERNAME/CAMERA_PASSWORD environment variables, not the JSON.
+    These three values must match what was used in the zoom_camera call
+    that started the move - they come from the abbreviated per-camera
+    summary produced by get_cameras (NOT the full camera representation):
+      camera_ptz_xaddr    <- that camera's ptz_xaddr
+      camera_time_offset  <- that camera's time_offset
+      camera_profile_token <- almost always the main profile's token,
+                              e.g. profiles[0].token, such as
+                              "MediaProfile000"
+
+    Credentials come from the CAMERA_USERNAME/CAMERA_PASSWORD environment
+    variables, not from any of these arguments.
 
     Has no effect on pan/tilt - use stop_camera_pan_tilt to stop a pan/tilt
     move. If no zoom move is currently in progress, this is a harmless
     no-op on most cameras.
 
     Args:
-        json_string: The abbreviated camera summary JSON string, as
-                     returned by get_cameras, containing at least
-                     ptz_xaddr and time_offset for this camera.
-        profile_token: The media profile token to command (should match
-                       whatever was used in the zoom_camera call).
+        camera_ptz_xaddr: That camera's ptz_xaddr, from get_cameras.
+        camera_profile_token: The media profile token to command (should
+                       match whatever was used in the zoom_camera call).
+        camera_time_offset: That camera's time_offset (an integer number
+                       of seconds) - a fresh value from get_cameras is
+                       fine here even if it differs slightly from the
+                       value used when the move was started.
 
     Returns:
         A message indicating success or failure
     """
-    try:
-        data = json.loads(json_string)
-    except Exception as e:
-        logger.error(f"Failed to parse camera JSON: {e}")
-        return f"Failed to parse camera JSON: {e}"
-
-    ptz_xaddr = data.get("ptz_xaddr")
-    if not ptz_xaddr:
+    if not camera_ptz_xaddr:
         return (
-            "This camera summary is missing ptz_xaddr - call get_cameras "
-            "again to get an up to date summary before retrying."
+            "camera_ptz_xaddr is required - call get_cameras again to get "
+            "an up to date summary before retrying."
         )
 
     camera = Camera()
-    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=ptz_xaddr))
+    camera.capabilities = Capabilities(ptz=PTZCapabilities(xaddr=camera_ptz_xaddr))
     camera.username = os.environ.get("CAMERA_USERNAME", "")
     camera.password = os.environ.get("CAMERA_PASSWORD", "")
-    camera.time_offset = data.get("time_offset", 0)
+    camera.time_offset = camera_time_offset
 
     try:
         camera.errors = None
-        move_stop(camera, profile_token, is_zoom=True)
+        move_stop(camera, camera_profile_token, is_zoom=True)
         if camera.errors:
             raise Exception(f"Camera returned errors: {camera.errors}")
-        return f"Successfully stopped zoom move on camera at {ptz_xaddr}."
+        return f"Successfully stopped zoom move on camera at {camera_ptz_xaddr}."
     except Exception as e:
-        logger.error(f"Failed to stop zoom move on camera at {ptz_xaddr}: {e}")
-        return f"Failed to stop zoom move on camera at {ptz_xaddr}: {e}"
+        logger.error(f"Failed to stop zoom move on camera at {camera_ptz_xaddr}: {e}")
+        return f"Failed to stop zoom move on camera at {camera_ptz_xaddr}: {e}"
 
 @mcp.tool()
 async def change_camera_hostname(ip_address: str, new_hostname: str) -> str:
