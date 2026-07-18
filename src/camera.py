@@ -292,6 +292,56 @@ async def set_camera_video_bitrate(ip_address: str, profile_token: str, bitrate_
         return f"Failed to set bitrate limit for camera at {camera.xaddr}: {e}"
 
 @mcp.tool()
+async def set_camera_video_gov_length(ip_address: str, profile_token: str, gov_length: int) -> str:
+    """
+    Set the video gov_length for one media profile on a camera.
+
+    This function queries the camera directly via ONVIF using its IP
+    address (with credentials from environment variables), builds a full
+    Camera object, sets the gov_length on that profile's
+    video_encoder, then pushes the whole encoder
+    configuration back to the camera in one ONVIF call. No JSON payload
+    is needed - just the camera's IP address.
+
+    Args:
+        ip_address: The IP address of the camera to command.
+        profile_token: The media profile token whose video_encoder should
+                       be pushed to the camera.
+        gov_length: Integer gov_length. Must fall within the
+                    camera-reported valid gov length range for this
+                    profile's current encoding.
+
+    Returns:
+        A message indicating success or failure
+    """
+    try:
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
+    except Exception as e:
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
+
+    try:
+        camera.errors = None
+
+        for profile in camera.profiles:
+            if profile.token == profile_token:
+                profile.video_encoder.gov_length = gov_length
+                set_video_encoder_configuration(camera, profile.video_encoder)
+                if camera.errors:
+                    raise Exception(f"Camera returned errors: {camera.errors}")
+                return f"Successfully set gov_length to {gov_length} for camera at {camera.xaddr}, profile {profile_token}."
+
+        return f"Profile {profile_token} not found on camera at {camera.xaddr}."
+
+    except Exception as e:
+        logger.error(f"Failed to set gov_length for camera at {camera.xaddr}: {e}")
+        return f"Failed to set gov_length for camera at {camera.xaddr}: {e}"
+
+@mcp.tool()
 async def set_camera_audio_encoder(json_string: str, profile_token: str) -> str:
     """
     Push the audio_encoder configuration for one media profile to a camera.
