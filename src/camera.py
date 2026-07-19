@@ -57,7 +57,7 @@ def camera_filled(camera: Camera) -> None:
 
 EVENT_SERVER_PORT = int(os.environ.get("EVENT_SERVER_PORT", "8856"))
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
-OPENCLAW_HOOK_URL = os.environ.get("OPENCLAW_HOOK_URL", "http://127.0.0.1:18789/hooks/agent")
+OPENCLAW_HOOK_URL = os.environ.get("OPENCLAW_HOOK_URL", "http://127.0.0.1:18789/hooks/camera-motion")
 OPENCLAW_HOOK_TOKEN = os.environ.get("OPENCLAW_HOOK_TOKEN", "")
 # Reserved subdirectory inside OpenClaw's own workspace where the agent
 # should save its own copy of the snapshot. $WORKSPACE_DIR is substituted
@@ -134,31 +134,78 @@ def _save_empty_motion_marker(filename: str):
 
 def _notify_openclaw_of_motion(filename: str) -> None:
     """
-    POST to OpenClaw's /hooks/agent endpoint, telling the agent exactly
-    what to do and where to save its own copy of the snapshot and
-    description - naming the exact tools and paths up front, rather than
-    leaving the agent to rediscover a working sequence through trial and
-    error on every motion event (get_snapshot_image_base64_encoded and
-    the browser tool both proved unusable to it in earlier testing).
+    POST to OpenClaw's /hooks/camera-motion endpoint (a named hook mapping
+    configured in openclaw.json, NOT the generic /hooks/agent path),
+    telling the agent exactly what to do and where to save its own copy
+    of the snapshot and description - naming the exact tools and paths
+    up front, rather than leaving the agent to rediscover a working
+    sequence through trial and error on every motion event
+    (get_snapshot_image_base64_encoded and the browser tool both proved
+    unusable to it in earlier testing).
+
+    Embeds the camera's snapshot_uri directly in the message rather than
+    instructing OpenClaw to look it up via camera__get_camera - we already
+    have it in memory (the same camera.profiles[0].snapshot_uri used by
+    _fetch_motion_snapshot above), fetched once when start_event_listener
+    ran, and it doesn't change between events for a given camera. This
+    removes one full tool round-trip (and the associated model reasoning
+    step) from every motion notification.
+
+    Requires an openclaw.json hooks.mappings entry like:
+
+        {
+          "id": "camera-motion",
+          "match": { "path": "camera-motion" },
+          "action": "agent",
+          "wakeMode": "now",
+          "name": "Camera Motion",
+          "messageTemplate": "{{payload.message}}",
+          "allowUnsafeExternalContent": true
+        }
+
+    allowUnsafeExternalContent must live in this mapping config, NOT in
+    the JSON body we send: normalizeAgentPayload() (the generic
+    /hooks/agent request parser) doesn't recognize that field at all, so
+    sending it directly in our payload was silently dropped - confirmed
+    by trajectory review showing the SECURITY NOTICE wrapper still
+    present after we started sending it. Worse, /hooks/agent and
+    /hooks/wake are special-cased in the request router and always
+    return before hooks.mappings is ever consulted, so no mapping -
+    including one matched by source rather than path - can apply to
+    those two paths regardless of config. A mapped path is the only way
+    to reach allowUnsafeExternalContent at all.
+
+    Without it, OpenClaw wraps this message in a SECURITY NOTICE +
+    EXTERNAL_UNTRUSTED_CONTENT boundary (since hook requests default to
+    externalContentSource: "webhook"), telling the model not to follow
+    instructions embedded in it - directly undermining the explicit
+    numbered steps below. We control both the sender (this script) and
+    the content (our own instructions), so this isn't actually untrusted
+    third-party content; it's just labeled that way by default. Batch
+    trajectory review showed the majority of sampled motion-event runs
+    called get_snapshot_image_base64_encoded anyway - the exact tool
+    step 1 explicitly says not to use - despite that instruction being
+    present in every one of those runs, so this is a hypothesis to test
+    against fresh, controlled events, not a confirmed fix.
     """
     camera_ip = _event_listener_state["camera_ip"]
+    snapshot_uri = _event_listener_state["camera"].profiles[0].snapshot_uri
     file_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{filename}"
     description_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{Path(filename).stem}.txt"
     payload = {
         "message": (
             f"Motion detected on the camera at {camera_ip}. Do the following:\n"
-            f"1. Call camera__download_snapshot_to_file with url set to that "
-            f"camera's snapshot_uri (from camera__get_camera) and file_path "
-            f"set to exactly \"{file_path}\".\n"
+            f"1. Call camera__download_snapshot_to_file with url set to exactly "
+            f"\"{snapshot_uri}\" and file_path set to exactly \"{file_path}\".\n"
             f"2. Call read on that same path to view the image.\n"
             f"3. Write a brief description of what you see using the write "
             f"tool, saving it to exactly \"{description_path}\" as plain "
             f"text (just the description itself, no extra formatting).\n"
-            "Do not use get_snapshot_image_base64_encoded or the browser tool "
-            "for this - go directly to download_snapshot_to_file, then read."
+            "Do not call camera__get_camera or any other camera tool to look up "
+            "the snapshot URL - it is already given above. Do not use "
+            "get_snapshot_image_base64_encoded or the browser tool for this - "
+            "go directly to download_snapshot_to_file, then read."
         ),
-        "name": "Camera Motion",
-        "wakeMode": "now",
     }
     try:
         response = requests.post(
@@ -1819,13 +1866,14 @@ async def start_event_listener(ip_address: str) -> str:
     Subscribes to that camera's VideoSource/MotionAlarm topic via ONVIF
     push events (a real server-side topic filter - the camera only sends
     matching events, not everything). On State: "true" (real motion), a
-    local snapshot is saved and OpenClaw is notified via its /hooks/agent
-    webhook with explicit instructions to save its own snapshot and a
-    text description, using a shared naming scheme
-    ({camera_ip}_{event_type}_{timestamp}.jpg/.txt) so the two are easy
-    to associate. On State: "false" (motion ended), only a 0-byte local
-    marker file is recorded - no OpenClaw notification, to avoid spending
-    an agent run on non-events.
+    local snapshot is saved and OpenClaw is notified via its
+    /hooks/camera-motion webhook (a named hook mapping, not the generic
+    /hooks/agent path - see _notify_openclaw_of_motion) with explicit
+    instructions to save its own snapshot and a text description, using
+    a shared naming scheme ({camera_ip}_{event_type}_{timestamp}.jpg/.txt)
+    so the two are easy to associate. On State: "false" (motion ended),
+    only a 0-byte local marker file is recorded - no OpenClaw
+    notification, to avoid spending an agent run on non-events.
 
     This is a first pass: the VideoSource/MotionAlarm topic is hard-coded
     rather than selectable - future versions will support subscribing to
