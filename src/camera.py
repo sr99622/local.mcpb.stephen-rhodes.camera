@@ -1,9 +1,12 @@
 import base64
 import json
 import logging
+from datetime import datetime
 from importlib.metadata import version as get_installed_version
 from pathlib import Path
 from libonvif.utils.adapters import find_adapters
+from libonvif.utils.server import EventServer
+from libonvif.utils.subscriber import SubscriptionManager
 from libonvif.devices.camera import Camera, discover, get_camera_by_ip, set_hostname, \
         set_video_encoder_configuration, set_audio_encoder_configuration, camera_from_json, refresh_camera, \
         goto_preset, continuous_move, move_stop, get_local_date_and_time, set_system_date_and_time, \
@@ -42,6 +45,164 @@ def on_error(xaddr: str, ex: Exception) -> None:
 
 def camera_filled(camera: Camera) -> None:
     logger.debug(f"Camera Filled: {camera.hostname} : {camera.device_information.serial_number}")
+
+# --- Event listener integration ---
+# Bridges the standalone motion_watcher.py prototype (packages/sse) into
+# this server as start/stop tools, generalized to "event listener" since
+# future work will subscribe to event topics beyond just motion.
+# EventServer already runs its TCP listener on its own background thread
+# once started, so start_event_listener just sets it up and returns
+# immediately - the MCP server keeps handling other tool calls normally
+# while events arrive independently.
+
+EVENT_SERVER_PORT = int(os.environ.get("EVENT_SERVER_PORT", "8856"))
+SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
+OPENCLAW_HOOK_URL = os.environ.get("OPENCLAW_HOOK_URL", "http://127.0.0.1:18789/hooks/agent")
+OPENCLAW_HOOK_TOKEN = os.environ.get("OPENCLAW_HOOK_TOKEN", "")
+# Reserved subdirectory inside OpenClaw's own workspace where the agent
+# should save its own copy of the snapshot. $WORKSPACE_DIR is substituted
+# by OpenClaw itself when a tool call uses it - not something we resolve
+# here. This is separate from SNAPSHOT_DIR above, which is our own local
+# copy on this machine.
+OPENCLAW_SNAPSHOT_SUBDIR = "camera-events"
+
+# Module-level state for the running listener, persisting between the
+# start_event_listener and stop_event_listener tool calls (each call is a
+# fresh function invocation, but this module stays loaded for the life of
+# the server process). Only one listener is supported at a time for this
+# first pass - starting a second one while one is already running returns
+# an error rather than replacing it silently.
+_event_listener_state = {
+    "camera": None,
+    "camera_ip": None,
+    "event_server": None,
+    "subscription_manager": None,
+}
+
+
+def _build_snapshot_filename(camera_ip: str, event_type: str) -> str:
+    """
+    Shared naming scheme for every snapshot/marker file the event
+    listener produces, so files can be found by camera, event type, and
+    time without needing to open them:
+
+        {camera_ip with dashes instead of dots}_{event_type}_{timestamp}.jpg
+
+    e.g. "10-1-1-77_motion_true_20260718T215035.jpg"
+    """
+    safe_ip = camera_ip.replace(".", "-")
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    return f"{safe_ip}_{event_type}_{timestamp}.jpg"
+
+
+def _fetch_motion_snapshot(filename: str):
+    """
+    Download the watched camera's current snapshot as a JPEG file, saved
+    under the given filename. Returns the saved Path, or None on failure.
+    """
+    camera = _event_listener_state["camera"]
+    snapshot_uri = camera.profiles[0].snapshot_uri
+    try:
+        response = requests.get(
+            snapshot_uri,
+            auth=HTTPDigestAuth(os.environ.get("CAMERA_USERNAME", ""), os.environ.get("CAMERA_PASSWORD", "")),
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Failed to fetch motion snapshot: {e}")
+        return None
+
+    SNAPSHOT_DIR.mkdir(exist_ok=True)
+    path = SNAPSHOT_DIR / filename
+    path.write_bytes(response.content)
+    logger.debug(f"Saved motion snapshot to {path}")
+    return path
+
+
+def _save_empty_motion_marker(filename: str):
+    """
+    Save a 0-byte marker file recording a motion-ended (State: false)
+    event without fetching a real image for it.
+    """
+    SNAPSHOT_DIR.mkdir(exist_ok=True)
+    path = SNAPSHOT_DIR / filename
+    path.touch()
+    logger.debug(f"Recorded empty motion marker at {path}")
+    return path
+
+
+def _notify_openclaw_of_motion(filename: str) -> None:
+    """
+    POST to OpenClaw's /hooks/agent endpoint, telling the agent exactly
+    what to do and where to save its own copy of the snapshot and
+    description - naming the exact tools and paths up front, rather than
+    leaving the agent to rediscover a working sequence through trial and
+    error on every motion event (get_snapshot_image_base64_encoded and
+    the browser tool both proved unusable to it in earlier testing).
+    """
+    camera_ip = _event_listener_state["camera_ip"]
+    file_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{filename}"
+    description_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{Path(filename).stem}.txt"
+    payload = {
+        "message": (
+            f"Motion detected on the camera at {camera_ip}. Do the following:\n"
+            f"1. Call camera__download_snapshot_to_file with url set to that "
+            f"camera's snapshot_uri (from camera__get_camera) and file_path "
+            f"set to exactly \"{file_path}\".\n"
+            f"2. Call read on that same path to view the image.\n"
+            f"3. Write a brief description of what you see using the write "
+            f"tool, saving it to exactly \"{description_path}\" as plain "
+            f"text (just the description itself, no extra formatting).\n"
+            "Do not use get_snapshot_image_base64_encoded or the browser tool "
+            "for this - go directly to download_snapshot_to_file, then read."
+        ),
+        "name": "Camera Motion",
+        "wakeMode": "now",
+    }
+    try:
+        response = requests.post(
+            OPENCLAW_HOOK_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {OPENCLAW_HOOK_TOKEN}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        logger.debug(f"Notified OpenClaw: {response.json()}")
+    except Exception as e:
+        logger.error(f"Failed to notify OpenClaw: {e}")
+
+
+def _on_event_listener_event(alarms: list[dict]) -> None:
+    """
+    Callback invoked by EventServer's background thread on every incoming
+    ONVIF event. Filters on the VideoSource/MotionAlarm State field:
+    State: "true" (real motion) saves a real local snapshot and notifies
+    OpenClaw. State: "false" (motion ended) only records a 0-byte local
+    marker file - no OpenClaw notification, since spending an agent run
+    on "motion stopped" would reintroduce the noise the topic-level
+    subscription filter (VideoSource/MotionAlarm only, not all events)
+    was meant to cut.
+
+    Currently only the motion topic is handled (see start_event_listener)
+    - as more event topics are subscribed to in the future, this is the
+    dispatch point where topic-specific handling would branch.
+    """
+    for alarm in alarms:
+        logger.debug(f"Event listener event: {alarm}")
+
+        if alarm.get("topic") != "VideoSource/MotionAlarm":
+            continue
+
+        is_motion = str(alarm.get("data", {}).get("State", "")).lower() == "true"
+        event_type = "motion_true" if is_motion else "motion_false"
+        filename = _build_snapshot_filename(_event_listener_state["camera_ip"], event_type)
+
+        if is_motion:
+            _fetch_motion_snapshot(filename)
+            _notify_openclaw_of_motion(filename)
+        else:
+            _save_empty_motion_marker(filename)
 
 def list_files(directory):
     """Recursively list all files in a directory."""
@@ -1649,6 +1810,117 @@ async def get_cameras() -> str:
         summaries.append(json.dumps(summary))
 
     return "\n--\n".join(summaries)
+
+@mcp.tool()
+async def start_event_listener(ip_address: str) -> str:
+    """
+    Start watching a camera for events and notifying OpenClaw.
+
+    Subscribes to that camera's VideoSource/MotionAlarm topic via ONVIF
+    push events (a real server-side topic filter - the camera only sends
+    matching events, not everything). On State: "true" (real motion), a
+    local snapshot is saved and OpenClaw is notified via its /hooks/agent
+    webhook with explicit instructions to save its own snapshot and a
+    text description, using a shared naming scheme
+    ({camera_ip}_{event_type}_{timestamp}.jpg/.txt) so the two are easy
+    to associate. On State: "false" (motion ended), only a 0-byte local
+    marker file is recorded - no OpenClaw notification, to avoid spending
+    an agent run on non-events.
+
+    This is a first pass: the VideoSource/MotionAlarm topic is hard-coded
+    rather than selectable - future versions will support subscribing to
+    other event topics too. Only one listener can run at a time - call
+    stop_event_listener before starting a new one on a different camera.
+
+    Requires the OPENCLAW_HOOK_TOKEN environment variable to be set to
+    match openclaw.json's hooks.token, or every real motion event will
+    fail to notify OpenClaw (though the local snapshot/marker recording
+    will still work regardless).
+
+    Args:
+        ip_address: The IP address of the camera to watch.
+
+    Returns:
+        A message indicating success or failure
+    """
+    if _event_listener_state["event_server"] is not None:
+        return (
+            f"An event listener is already running for camera at "
+            f"{_event_listener_state['camera_ip']}. Call stop_event_listener "
+            "first before starting a new one."
+        )
+
+    if not OPENCLAW_HOOK_TOKEN:
+        return (
+            "OPENCLAW_HOOK_TOKEN is not set - this must match openclaw.json's "
+            "hooks.token, or motion notifications will silently fail to reach "
+            "OpenClaw. Set it in this server's environment and restart before "
+            "starting the listener."
+        )
+
+    try:
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
+    except Exception as e:
+        logger.error(f"Failed to query camera at {ip_address}: {e}")
+        return f"Failed to query camera at {ip_address}: {e}"
+
+    try:
+        event_server = EventServer("0.0.0.0", EVENT_SERVER_PORT, _on_event_listener_event)
+        event_server.start()
+
+        subscription_manager = SubscriptionManager(camera)
+        subscription_manager.subscribe_push_event(camera, "0.0.0.0", EVENT_SERVER_PORT, "VideoSource/MotionAlarm")
+
+        _event_listener_state["camera"] = camera
+        _event_listener_state["camera_ip"] = ip_address
+        _event_listener_state["event_server"] = event_server
+        _event_listener_state["subscription_manager"] = subscription_manager
+
+        return (
+            f"Successfully started event listener for camera at {ip_address}, "
+            f"subscribed to VideoSource/MotionAlarm, listening on port {EVENT_SERVER_PORT}. "
+            "Call stop_event_listener to stop it."
+        )
+    except Exception as e:
+        logger.error(f"Failed to start event listener for camera at {ip_address}: {e}")
+        return f"Failed to start event listener for camera at {ip_address}: {e}"
+
+@mcp.tool()
+async def stop_event_listener() -> str:
+    """
+    Stop the currently running event listener, if any.
+
+    Unsubscribes from the camera's push events and shuts down the local
+    event listener. Safe to call even if no listener is currently running.
+
+    Returns:
+        A message indicating success or failure
+    """
+    camera = _event_listener_state["camera"]
+    camera_ip = _event_listener_state["camera_ip"]
+    event_server = _event_listener_state["event_server"]
+    subscription_manager = _event_listener_state["subscription_manager"]
+
+    if event_server is None:
+        return "No event listener is currently running."
+
+    try:
+        subscription_manager.unsubscribe_events(camera)
+        event_server.stop()
+
+        _event_listener_state["camera"] = None
+        _event_listener_state["camera_ip"] = None
+        _event_listener_state["event_server"] = None
+        _event_listener_state["subscription_manager"] = None
+
+        return f"Successfully stopped event listener for camera at {camera_ip}."
+    except Exception as e:
+        logger.error(f"Failed to stop event listener for camera at {camera_ip}: {e}")
+        return f"Failed to stop event listener for camera at {camera_ip}: {e}"
 
 
 def main():

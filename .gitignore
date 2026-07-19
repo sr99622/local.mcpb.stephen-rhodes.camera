@@ -2,3 +2,4 @@
 __pycache__/
 claude/
 *.mcpb
+src/snapshots/
