@@ -5,3 +5,4 @@ claude/
 src/snapshots/
 src/sessions/
 src/subscribed_events.json
+.DS_Store

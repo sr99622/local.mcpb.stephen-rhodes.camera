@@ -48,12 +48,14 @@ def camera_filled(camera: Camera) -> None:
 
 # --- Event listener integration ---
 # Bridges the standalone motion_watcher.py prototype (packages/sse) into
-# this server as start/stop tools, generalized to "event listener" since
-# future work will subscribe to event topics beyond just motion.
-# EventServer already runs its TCP listener on its own background thread
-# once started, so start_event_listener just sets it up and returns
-# immediately - the MCP server keeps handling other tool calls normally
-# while events arrive independently.
+# this server, generalized to "event listener" since future work will
+# subscribe to event topics beyond just motion. All cameras share ONE
+# EventServer (ONVIF push events are just an HTTP POST to whatever URL a
+# camera was told during Subscribe - nothing about the protocol requires
+# a separate listener per camera), created on first use by whichever
+# camera adds its first subscribed event. Each camera gets its own
+# SubscriptionManager, since subscriptions (and their resubscribe
+# timers) are inherently per-camera.
 
 EVENT_SERVER_PORT = int(os.environ.get("EVENT_SERVER_PORT", "8856"))
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
@@ -66,34 +68,32 @@ OPENCLAW_HOOK_TOKEN = os.environ.get("OPENCLAW_HOOK_TOKEN", "")
 # copy on this machine.
 OPENCLAW_SNAPSHOT_SUBDIR = "camera-events"
 
-# Module-level state for the running listener, persisting between the
-# start_event_listener and stop_event_listener tool calls (each call is a
-# fresh function invocation, but this module stays loaded for the life of
-# the server process). Only one listener is supported at a time for this
-# first pass - starting a second one while one is already running returns
-# an error rather than replacing it silently.
-_event_listener_state = {
-    "camera": None,
-    "camera_ip": None,
-    "event_server": None,
-    "subscription_manager": None,
-}
+# The one shared EventServer instance, or None until the first camera
+# adds a subscribed event. Created by _resync_camera_subscriptions.
+_event_server = None
+
+# Per-camera state, keyed by IP address: {"camera": Camera, "subscription_manager": SubscriptionManager}.
+# Populated lazily, the first time a given camera's subscriptions are
+# resynced. The Camera object here is queried once and then reused
+# across resyncs (its subscription_references list is what actually
+# tracks live ONVIF subscriptions) - it is NOT refreshed automatically,
+# so if a camera's IP/credentials/xaddr genuinely change, its entry here
+# would need to be rebuilt (not handled yet - a later concern).
+_camera_subscriptions: dict[str, dict] = {}
 
 # Persistent store, keyed by camera IP address, for the set of event
 # topics the user wants that camera marked for observation on. Kept
-# deliberately separate from _event_listener_state above: that state
-# tracks the one currently-running listener, while this needs to hold
-# preferences for potentially many cameras independently of whether a
-# listener happens to be running right now, and survive across
-# get_cameras() calls (which rediscovers cameras fresh every time, so
-# nothing stored on the Camera object itself persists between calls).
+# deliberately separate from _event_server/_camera_subscriptions above:
+# those track live ONVIF subscription state (built lazily, in memory
+# only), while this needs to hold user preferences for potentially many
+# cameras that survive both a server restart and rediscovery (nothing
+# stored on the Camera object itself persists across get_cameras() calls,
+# which rediscovers cameras fresh every time).
 #
 # Also persisted to disk (SUBSCRIBED_EVENTS_FILE) so these preferences
 # survive a server restart, not just repeated calls within one running
 # process - loaded once at import time below, and rewritten after every
 # add/remove so the file never falls out of sync with what's in memory.
-# This is the data structure only, for now - it does not yet drive any
-# real ONVIF subscription; that comes in a later step.
 SUBSCRIBED_EVENTS_FILE = Path(__file__).parent / "subscribed_events.json"
 
 
@@ -152,12 +152,11 @@ def _build_snapshot_filename(camera_ip: str, event_type: str) -> str:
     return f"{safe_ip}_{event_type}_{timestamp}.jpg"
 
 
-def _fetch_motion_snapshot(filename: str):
+def _fetch_motion_snapshot(camera: Camera, filename: str):
     """
-    Download the watched camera's current snapshot as a JPEG file, saved
+    Download the given camera's current snapshot as a JPEG file, saved
     under the given filename. Returns the saved Path, or None on failure.
     """
-    camera = _event_listener_state["camera"]
     snapshot_uri = camera.profiles[0].snapshot_uri
     try:
         response = requests.get(
@@ -189,7 +188,7 @@ def _save_empty_motion_marker(filename: str):
     return path
 
 
-def _notify_openclaw_of_motion(filename: str) -> None:
+def _notify_openclaw_of_motion(camera_ip: str, snapshot_uri: str, filename: str) -> None:
     """
     POST to OpenClaw's /hooks/camera-motion endpoint (a named hook mapping
     configured in openclaw.json, NOT the generic /hooks/agent path),
@@ -201,12 +200,12 @@ def _notify_openclaw_of_motion(filename: str) -> None:
     unusable to it in earlier testing).
 
     Embeds the camera's snapshot_uri directly in the message rather than
-    instructing OpenClaw to look it up via camera__get_camera - we already
-    have it in memory (the same camera.profiles[0].snapshot_uri used by
-    _fetch_motion_snapshot above), fetched once when start_event_listener
-    ran, and it doesn't change between events for a given camera. This
-    removes one full tool round-trip (and the associated model reasoning
-    step) from every motion notification.
+    instructing OpenClaw to look it up via camera__get_camera - the
+    caller already has it (from that camera's entry in
+    _camera_subscriptions, populated once when its subscriptions were
+    first resynced, since it doesn't change between events for a given
+    camera). This removes one full tool round-trip (and the associated
+    model reasoning step) from every motion notification.
 
     Requires an openclaw.json hooks.mappings entry like:
 
@@ -245,8 +244,6 @@ def _notify_openclaw_of_motion(filename: str) -> None:
     present in every one of those runs, so this is a hypothesis to test
     against fresh, controlled events, not a confirmed fix.
     """
-    camera_ip = _event_listener_state["camera_ip"]
-    snapshot_uri = _event_listener_state["camera"].profiles[0].snapshot_uri
     file_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{filename}"
     description_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{Path(filename).stem}.txt"
     payload = {
@@ -277,34 +274,97 @@ def _notify_openclaw_of_motion(filename: str) -> None:
         logger.error(f"Failed to notify OpenClaw: {e}")
 
 
+def _resync_camera_subscriptions(ip_address: str) -> None:
+    """
+    Reconcile a camera's real ONVIF push subscriptions with whatever is
+    currently in _subscribed_events_by_camera for it.
+
+    ONVIF only offers Unsubscribe, which removes ALL of a camera's push
+    subscriptions at once - there is no operation to target a single
+    topic while leaving others active. So rather than having add/remove
+    take two different paths against the camera's real subscription
+    state (which could drift apart or handle edge cases differently),
+    both funnel through this one function: unsubscribe everything for
+    this camera, then resubscribe to exactly the topics currently in its
+    bookkeeping list. Called after the bookkeeping list has already been
+    updated to reflect the desired end state.
+
+    Ensures the shared EventServer exists first (starting it on the very
+    first call across any camera), and this camera's own
+    SubscriptionManager exists (creating it, and querying the camera
+    fresh, the first time this particular camera is resynced).
+
+    Raises on failure (e.g. camera unreachable) rather than swallowing
+    the error, so callers can decide whether to roll back their
+    bookkeeping change.
+    """
+    global _event_server
+
+    if _event_server is None:
+        _event_server = EventServer("0.0.0.0", EVENT_SERVER_PORT, _on_event_listener_event)
+        _event_server.start()
+
+    if ip_address not in _camera_subscriptions:
+        camera = get_camera_by_ip(
+            ip_address,
+            os.environ.get("CAMERA_USERNAME", ""),
+            os.environ.get("CAMERA_PASSWORD", ""),
+        )
+        _camera_subscriptions[ip_address] = {
+            "camera": camera,
+            "subscription_manager": SubscriptionManager(camera),
+        }
+
+    entry = _camera_subscriptions[ip_address]
+    camera = entry["camera"]
+    subscription_manager = entry["subscription_manager"]
+
+    subscription_manager.unsubscribe_events(camera)
+
+    for topic in _subscribed_events_by_camera.get(ip_address, []):
+        subscription_manager.subscribe_push_event(camera, "0.0.0.0", EVENT_SERVER_PORT, topic)
+
+
 def _on_event_listener_event(alarms: list[dict]) -> None:
     """
     Callback invoked by EventServer's background thread on every incoming
-    ONVIF event. Filters on the VideoSource/MotionAlarm State field:
+    ONVIF event, from any camera - all cameras share this one EventServer,
+    so this looks up which camera an event actually came from via its
+    ip_address field (present on every parsed alarm) against
+    _camera_subscriptions, rather than assuming a single fixed camera.
+
+    Still only ACTS on VideoSource/MotionAlarm for now, even though a
+    camera may genuinely be subscribed to other topics too (subscribing
+    itself is already fully general as of _resync_camera_subscriptions
+    above) - generalizing this handling logic to other topics is a
+    separate, later step. Events on any other topic are received here
+    but currently just ignored.
+
     State: "true" (real motion) saves a real local snapshot and notifies
     OpenClaw. State: "false" (motion ended) only records a 0-byte local
     marker file - no OpenClaw notification, since spending an agent run
-    on "motion stopped" would reintroduce the noise the topic-level
-    subscription filter (VideoSource/MotionAlarm only, not all events)
-    was meant to cut.
-
-    Currently only the motion topic is handled (see start_event_listener)
-    - as more event topics are subscribed to in the future, this is the
-    dispatch point where topic-specific handling would branch.
+    on "motion stopped" would reintroduce noise.
     """
     for alarm in alarms:
         logger.debug(f"Event listener event: {alarm}")
 
+        camera_ip = alarm.get("ip_address")
+        entry = _camera_subscriptions.get(camera_ip)
+        if not entry:
+            logger.error(f"Received event for camera at {camera_ip}, which has no tracked subscription; ignoring.")
+            continue
+
         if alarm.get("topic") != "VideoSource/MotionAlarm":
             continue
 
+        camera = entry["camera"]
         is_motion = str(alarm.get("data", {}).get("State", "")).lower() == "true"
         event_type = "motion_true" if is_motion else "motion_false"
-        filename = _build_snapshot_filename(_event_listener_state["camera_ip"], event_type)
+        filename = _build_snapshot_filename(camera_ip, event_type)
 
         if is_motion:
-            _fetch_motion_snapshot(filename)
-            _notify_openclaw_of_motion(filename)
+            _fetch_motion_snapshot(camera, filename)
+            _notify_openclaw_of_motion(camera_ip, camera.profiles[0].snapshot_uri, filename)
         else:
             _save_empty_motion_marker(filename)
 
@@ -1921,132 +1981,34 @@ async def get_cameras() -> str:
     return "\n--\n".join(summaries)
 
 @mcp.tool()
-async def start_event_listener(ip_address: str) -> str:
-    """
-    Start watching a camera for events and notifying OpenClaw.
-
-    Subscribes to that camera's VideoSource/MotionAlarm topic via ONVIF
-    push events (a real server-side topic filter - the camera only sends
-    matching events, not everything). On State: "true" (real motion), a
-    local snapshot is saved and OpenClaw is notified via its
-    /hooks/camera-motion webhook (a named hook mapping, not the generic
-    /hooks/agent path - see _notify_openclaw_of_motion) with explicit
-    instructions to save its own snapshot and a text description, using
-    a shared naming scheme ({camera_ip}_{event_type}_{timestamp}.jpg/.txt)
-    so the two are easy to associate. On State: "false" (motion ended),
-    only a 0-byte local marker file is recorded - no OpenClaw
-    notification, to avoid spending an agent run on non-events.
-
-    This is a first pass: the VideoSource/MotionAlarm topic is hard-coded
-    rather than selectable - future versions will support subscribing to
-    other event topics too. Only one listener can run at a time - call
-    stop_event_listener before starting a new one on a different camera.
-
-    Requires the OPENCLAW_HOOK_TOKEN environment variable to be set to
-    match openclaw.json's hooks.token, or every real motion event will
-    fail to notify OpenClaw (though the local snapshot/marker recording
-    will still work regardless).
-
-    Args:
-        ip_address: The IP address of the camera to watch.
-
-    Returns:
-        A message indicating success or failure
-    """
-    if _event_listener_state["event_server"] is not None:
-        return (
-            f"An event listener is already running for camera at "
-            f"{_event_listener_state['camera_ip']}. Call stop_event_listener "
-            "first before starting a new one."
-        )
-
-    if not OPENCLAW_HOOK_TOKEN:
-        return (
-            "OPENCLAW_HOOK_TOKEN is not set - this must match openclaw.json's "
-            "hooks.token, or motion notifications will silently fail to reach "
-            "OpenClaw. Set it in this server's environment and restart before "
-            "starting the listener."
-        )
-
-    try:
-        camera = get_camera_by_ip(
-            ip_address,
-            os.environ.get("CAMERA_USERNAME", ""),
-            os.environ.get("CAMERA_PASSWORD", ""),
-        )
-    except Exception as e:
-        logger.error(f"Failed to query camera at {ip_address}: {e}")
-        return f"Failed to query camera at {ip_address}: {e}"
-
-    try:
-        event_server = EventServer("0.0.0.0", EVENT_SERVER_PORT, _on_event_listener_event)
-        event_server.start()
-
-        subscription_manager = SubscriptionManager(camera)
-        subscription_manager.subscribe_push_event(camera, "0.0.0.0", EVENT_SERVER_PORT, "VideoSource/MotionAlarm")
-
-        _event_listener_state["camera"] = camera
-        _event_listener_state["camera_ip"] = ip_address
-        _event_listener_state["event_server"] = event_server
-        _event_listener_state["subscription_manager"] = subscription_manager
-
-        return (
-            f"Successfully started event listener for camera at {ip_address}, "
-            f"subscribed to VideoSource/MotionAlarm, listening on port {EVENT_SERVER_PORT}. "
-            "Call stop_event_listener to stop it."
-        )
-    except Exception as e:
-        logger.error(f"Failed to start event listener for camera at {ip_address}: {e}")
-        return f"Failed to start event listener for camera at {ip_address}: {e}"
-
-@mcp.tool()
-async def stop_event_listener() -> str:
-    """
-    Stop the currently running event listener, if any.
-
-    Unsubscribes from the camera's push events and shuts down the local
-    event listener. Safe to call even if no listener is currently running.
-
-    Returns:
-        A message indicating success or failure
-    """
-    camera = _event_listener_state["camera"]
-    camera_ip = _event_listener_state["camera_ip"]
-    event_server = _event_listener_state["event_server"]
-    subscription_manager = _event_listener_state["subscription_manager"]
-
-    if event_server is None:
-        return "No event listener is currently running."
-
-    try:
-        subscription_manager.unsubscribe_events(camera)
-        event_server.stop()
-
-        _event_listener_state["camera"] = None
-        _event_listener_state["camera_ip"] = None
-        _event_listener_state["event_server"] = None
-        _event_listener_state["subscription_manager"] = None
-
-        return f"Successfully stopped event listener for camera at {camera_ip}."
-    except Exception as e:
-        logger.error(f"Failed to stop event listener for camera at {camera_ip}: {e}")
-        return f"Failed to stop event listener for camera at {camera_ip}: {e}"
-
-@mcp.tool()
 async def add_subscribed_event(ip_address: str, event_topic: str) -> str:
     """
-    Mark an event topic as one this camera should be observed for.
+    Subscribe a camera to an ONVIF event topic and mark it as observed.
 
-    This only updates this server's own bookkeeping (visible afterward
-    as that camera's subscribed_events list in get_cameras) - it does
-    NOT yet subscribe to the event with the camera itself. Real ONVIF
-    subscription support is a later step; for now this just builds up
-    the list of what should eventually be subscribed to.
+    Updates this server's own bookkeeping (visible afterward as that
+    camera's subscribed_events list in get_cameras) AND performs the
+    real ONVIF subscription on the camera itself.
+
+    Internally this always does a full resync rather than an incremental
+    add: ONVIF only offers Unsubscribe, which removes ALL of a camera's
+    push subscriptions at once - there is no way to unsubscribe a single
+    topic while leaving others active. So both this tool and
+    remove_subscribed_event share one path (_resync_camera_subscriptions):
+    unsubscribe everything for this camera, then resubscribe to every
+    topic currently in its subscribed_events list. This keeps add and
+    remove from ever handling the camera's real subscription state
+    differently. All cameras share one underlying event listener - the
+    first call to either tool, for any camera, starts it; every
+    subsequent call (for that camera or any other) reuses it.
+
+    If the real subscription fails (e.g. the camera is unreachable), the
+    bookkeeping change is rolled back rather than left showing a topic
+    as subscribed when it isn't.
 
     event_topic is not validated against the camera's real topics here -
     it should be one of the strings in that camera's event_topics list
-    (from get_cameras), but a typo will silently create an entry that
-    doesn't correspond to anything real rather than being rejected.
+    (from get_cameras), but a typo will be sent to the camera as a
+    literal (and likely rejected or silently non-matching) topic filter.
 
     Args:
         ip_address: The IP address of the camera.
@@ -2061,20 +2023,38 @@ async def add_subscribed_event(ip_address: str, event_topic: str) -> str:
     events = _subscribed_events_by_camera.setdefault(ip_address, [])
     if event_topic in events:
         return f"{event_topic} is already in the subscribed_events list for camera at {ip_address}. Current list: {events}"
+
     events.append(event_topic)
     _save_subscribed_events_to_disk()
-    return f"Added {event_topic} to the subscribed_events list for camera at {ip_address}. Current list: {events}"
+
+    try:
+        _resync_camera_subscriptions(ip_address)
+        return f"Added {event_topic} to the subscribed_events list for camera at {ip_address}, and subscribed on the camera. Current list: {events}"
+    except Exception as e:
+        events.remove(event_topic)
+        _save_subscribed_events_to_disk()
+        logger.error(f"Failed to subscribe camera at {ip_address} to {event_topic}: {e}")
+        return f"Failed to subscribe camera at {ip_address} to {event_topic}: {e}"
 
 @mcp.tool()
 async def remove_subscribed_event(ip_address: str, event_topic: str) -> str:
     """
-    Remove an event topic from the list of events this camera should be
-    observed for.
+    Unsubscribe a camera from an ONVIF event topic and remove it from
+    observation.
 
-    This only updates this server's own bookkeeping (visible afterward
-    as that camera's subscribed_events list in get_cameras) - it does
-    NOT yet unsubscribe from anything with the camera itself. Real ONVIF
-    subscription support is a later step.
+    Updates this server's own bookkeeping (visible afterward as that
+    camera's subscribed_events list in get_cameras) AND performs the
+    real ONVIF unsubscription on the camera itself.
+
+    See add_subscribed_event for why this always does a full resync
+    (unsubscribe everything for this camera, then resubscribe to every
+    remaining topic) rather than removing just this one topic - ONVIF's
+    Unsubscribe operation has no way to target a single subscription
+    while leaving others active.
+
+    If the resync fails, the bookkeeping change is rolled back rather
+    than left showing a topic as unsubscribed when the camera might
+    still be sending it.
 
     Args:
         ip_address: The IP address of the camera.
@@ -2088,9 +2068,18 @@ async def remove_subscribed_event(ip_address: str, event_topic: str) -> str:
     events = _subscribed_events_by_camera.get(ip_address, [])
     if event_topic not in events:
         return f"{event_topic} is not in the subscribed_events list for camera at {ip_address}. Current list: {events}"
+
     events.remove(event_topic)
     _save_subscribed_events_to_disk()
-    return f"Removed {event_topic} from the subscribed_events list for camera at {ip_address}. Current list: {events}"
+
+    try:
+        _resync_camera_subscriptions(ip_address)
+        return f"Removed {event_topic} from the subscribed_events list for camera at {ip_address}, and unsubscribed on the camera. Current list: {events}"
+    except Exception as e:
+        events.append(event_topic)
+        _save_subscribed_events_to_disk()
+        logger.error(f"Failed to unsubscribe camera at {ip_address} from {event_topic}: {e}")
+        return f"Failed to unsubscribe camera at {ip_address} from {event_topic}: {e}"
 
 
 def main():
