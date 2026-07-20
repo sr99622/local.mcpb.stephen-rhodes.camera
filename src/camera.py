@@ -79,6 +79,63 @@ _event_listener_state = {
     "subscription_manager": None,
 }
 
+# Persistent store, keyed by camera IP address, for the set of event
+# topics the user wants that camera marked for observation on. Kept
+# deliberately separate from _event_listener_state above: that state
+# tracks the one currently-running listener, while this needs to hold
+# preferences for potentially many cameras independently of whether a
+# listener happens to be running right now, and survive across
+# get_cameras() calls (which rediscovers cameras fresh every time, so
+# nothing stored on the Camera object itself persists between calls).
+#
+# Also persisted to disk (SUBSCRIBED_EVENTS_FILE) so these preferences
+# survive a server restart, not just repeated calls within one running
+# process - loaded once at import time below, and rewritten after every
+# add/remove so the file never falls out of sync with what's in memory.
+# This is the data structure only, for now - it does not yet drive any
+# real ONVIF subscription; that comes in a later step.
+SUBSCRIBED_EVENTS_FILE = Path(__file__).parent / "subscribed_events.json"
+
+
+def _load_subscribed_events_from_disk() -> dict[str, list[str]]:
+    """
+    Load the persisted subscribed-events store from disk. Returns an
+    empty dict if the file doesn't exist yet (first run) or can't be
+    parsed (corrupt/manually-edited file) - this is a preferences cache,
+    not critical data, so a bad file should not prevent the server from
+    starting.
+    """
+    if not SUBSCRIBED_EVENTS_FILE.exists():
+        return {}
+    try:
+        with open(SUBSCRIBED_EVENTS_FILE, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.error(f"{SUBSCRIBED_EVENTS_FILE} did not contain a JSON object; ignoring.")
+            return {}
+        return data
+    except Exception as e:
+        logger.error(f"Failed to load {SUBSCRIBED_EVENTS_FILE}: {e}")
+        return {}
+
+
+def _save_subscribed_events_to_disk() -> None:
+    """
+    Persist the current subscribed-events store to disk. Called after
+    every add/remove so the on-disk copy never falls out of sync with
+    what's in memory. Failures are logged but not raised - a failed save
+    shouldn't break the add/remove tool call itself, just means the
+    change won't survive a restart.
+    """
+    try:
+        with open(SUBSCRIBED_EVENTS_FILE, "w") as f:
+            json.dump(_subscribed_events_by_camera, f, indent=4)
+    except Exception as e:
+        logger.error(f"Failed to save {SUBSCRIBED_EVENTS_FILE}: {e}")
+
+
+_subscribed_events_by_camera: dict[str, list[str]] = _load_subscribed_events_from_disk()
+
 
 def _build_snapshot_filename(camera_ip: str, event_type: str) -> str:
     """
@@ -1840,6 +1897,9 @@ async def get_cameras() -> str:
         ptz_caps = caps.get("ptz") or {}
         ptz_xaddr = ptz_caps.get("xaddr") or ""
 
+        event_props = data.get("event_properties") or {}
+        event_topics = event_props.get("topic_set") or []
+
         summary = {
             "hostname": hostname_obj.get("name") or data.get("name") or "",
             "ip_address": ip_addr,
@@ -1852,6 +1912,8 @@ async def get_cameras() -> str:
             "ptz_tours": tours,
             "ptz_status": ptz_st,
             "ptz_xaddr": ptz_xaddr,
+            "event_topics": event_topics,
+            "subscribed_events": list(_subscribed_events_by_camera.get(ip_addr, [])),
             "time_offset": int(data.get("time_offset") or 0)
         }
         summaries.append(json.dumps(summary))
@@ -1969,6 +2031,66 @@ async def stop_event_listener() -> str:
     except Exception as e:
         logger.error(f"Failed to stop event listener for camera at {camera_ip}: {e}")
         return f"Failed to stop event listener for camera at {camera_ip}: {e}"
+
+@mcp.tool()
+async def add_subscribed_event(ip_address: str, event_topic: str) -> str:
+    """
+    Mark an event topic as one this camera should be observed for.
+
+    This only updates this server's own bookkeeping (visible afterward
+    as that camera's subscribed_events list in get_cameras) - it does
+    NOT yet subscribe to the event with the camera itself. Real ONVIF
+    subscription support is a later step; for now this just builds up
+    the list of what should eventually be subscribed to.
+
+    event_topic is not validated against the camera's real topics here -
+    it should be one of the strings in that camera's event_topics list
+    (from get_cameras), but a typo will silently create an entry that
+    doesn't correspond to anything real rather than being rejected.
+
+    Args:
+        ip_address: The IP address of the camera.
+        event_topic: The event topic string to add, e.g.
+                     "RuleEngine/CellMotionDetector/Motion" - see that
+                     camera's event_topics list in get_cameras for the
+                     full set of valid values.
+
+    Returns:
+        A message indicating the result, including the resulting list.
+    """
+    events = _subscribed_events_by_camera.setdefault(ip_address, [])
+    if event_topic in events:
+        return f"{event_topic} is already in the subscribed_events list for camera at {ip_address}. Current list: {events}"
+    events.append(event_topic)
+    _save_subscribed_events_to_disk()
+    return f"Added {event_topic} to the subscribed_events list for camera at {ip_address}. Current list: {events}"
+
+@mcp.tool()
+async def remove_subscribed_event(ip_address: str, event_topic: str) -> str:
+    """
+    Remove an event topic from the list of events this camera should be
+    observed for.
+
+    This only updates this server's own bookkeeping (visible afterward
+    as that camera's subscribed_events list in get_cameras) - it does
+    NOT yet unsubscribe from anything with the camera itself. Real ONVIF
+    subscription support is a later step.
+
+    Args:
+        ip_address: The IP address of the camera.
+        event_topic: The event topic string to remove, exactly as it
+                     currently appears in that camera's subscribed_events
+                     list (from get_cameras).
+
+    Returns:
+        A message indicating the result, including the resulting list.
+    """
+    events = _subscribed_events_by_camera.get(ip_address, [])
+    if event_topic not in events:
+        return f"{event_topic} is not in the subscribed_events list for camera at {ip_address}. Current list: {events}"
+    events.remove(event_topic)
+    _save_subscribed_events_to_disk()
+    return f"Removed {event_topic} from the subscribed_events list for camera at {ip_address}. Current list: {events}"
 
 
 def main():

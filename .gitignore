@@ -4,3 +4,4 @@ claude/
 *.mcpb
 src/snapshots/
 src/sessions/
+src/subscribed_events.json
