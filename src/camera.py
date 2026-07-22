@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from datetime import datetime
 from importlib.metadata import version as get_installed_version
 from pathlib import Path
@@ -30,8 +31,15 @@ import shutil
 import subprocess
 from typing import Any
 
-logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+LOG_FILE = Path(__file__).parent / "camera_events.log"
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.WARNING,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 mcp = FastMCP("camera")
 
@@ -65,12 +73,19 @@ EVENT_SERVER_PORT = int(os.environ.get("EVENT_SERVER_PORT", "8856"))
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 OPENCLAW_HOOK_URL = os.environ.get("OPENCLAW_HOOK_URL", "http://127.0.0.1:18789/hooks/camera-motion")
 OPENCLAW_HOOK_TOKEN = os.environ.get("OPENCLAW_HOOK_TOKEN", "")
-# Reserved subdirectory inside OpenClaw's own workspace where the agent
-# should save its own copy of the snapshot. $WORKSPACE_DIR is substituted
-# by OpenClaw itself when a tool call uses it - not something we resolve
-# here. This is separate from SNAPSHOT_DIR above, which is our own local
-# copy on this machine.
+# Home-relative subdirectory OpenClaw uses as its own workspace folder for
+# camera snapshots/descriptions. Motion-event snapshots are now written
+# directly here by _on_event_listener_event (see CAMERA_EVENTS_DIR below)
+# instead of camera.py's own SNAPSHOT_DIR, so there is exactly one capture
+# per event, taken at alarm time, and OpenClaw's `read` tool loads those
+# same bytes rather than re-querying the camera itself several seconds
+# later once its own reasoning gets around to a download step. OpenClaw's
+# own tools already resolve "~" against this same machine's home
+# directory (confirmed via trajectory review), so using "~" in both the
+# path we write to and the path we tell OpenClaw to read needs no
+# $WORKSPACE_DIR substitution or other coordination.
 OPENCLAW_SNAPSHOT_SUBDIR = "camera-events"
+CAMERA_EVENTS_DIR = Path(os.path.expanduser(f"~/{OPENCLAW_SNAPSHOT_SUBDIR}"))
 
 # The one shared EventServer instance, or None until the first camera
 # adds a subscribed event. Created by _ensure_camera_subscription_entry.
@@ -207,10 +222,16 @@ def _build_snapshot_filename(camera_ip: str, event_type: str) -> str:
     return f"{safe_ip}_{event_type}_{timestamp}.jpg"
 
 
-def _fetch_motion_snapshot(camera: Camera, filename: str):
+def _fetch_motion_snapshot(camera: Camera, filename: str, directory: Path = SNAPSHOT_DIR):
     """
     Download the given camera's current snapshot as a JPEG file, saved
-    under the given filename. Returns the saved Path, or None on failure.
+    under the given filename in the given directory (SNAPSHOT_DIR by
+    default). Returns the saved Path, or None on failure.
+
+    Motion-event calls from _on_event_listener_event pass
+    directory=CAMERA_EVENTS_DIR instead, so the one fetch this function
+    performs lands directly where OpenClaw will read it from - see the
+    comment on CAMERA_EVENTS_DIR above for why that matters.
     """
     snapshot_uri = camera.profiles[0].snapshot_uri
     try:
@@ -224,8 +245,8 @@ def _fetch_motion_snapshot(camera: Camera, filename: str):
         logger.error(f"Failed to fetch motion snapshot: {e}")
         return None
 
-    SNAPSHOT_DIR.mkdir(exist_ok=True)
-    path = SNAPSHOT_DIR / filename
+    directory.mkdir(exist_ok=True, parents=True)
+    path = directory / filename
     path.write_bytes(response.content)
     logger.debug(f"Saved motion snapshot to {path}")
     return path
@@ -243,24 +264,33 @@ def _save_empty_motion_marker(filename: str):
     return path
 
 
-def _notify_openclaw_of_motion(camera_ip: str, snapshot_uri: str, filename: str) -> None:
+def _notify_openclaw_of_motion(camera_ip: str, filename: str) -> None:
     """
     POST to OpenClaw's /hooks/camera-motion endpoint (a named hook mapping
     configured in openclaw.json, NOT the generic /hooks/agent path),
-    telling the agent exactly what to do and where to save its own copy
-    of the snapshot and description - naming the exact tools and paths
-    up front, rather than leaving the agent to rediscover a working
-    sequence through trial and error on every motion event
-    (get_snapshot_image_base64_encoded and the browser tool both proved
-    unusable to it in earlier testing).
+    telling the agent exactly what to do and where to find the snapshot
+    and description - naming the exact tools and paths up front, rather
+    than leaving the agent to rediscover a working sequence through
+    trial and error on every motion event (get_snapshot_image_base64_encoded
+    and the browser tool both proved unusable to it in earlier testing).
 
-    Embeds the camera's snapshot_uri directly in the message rather than
-    instructing OpenClaw to look it up via camera__get_camera - the
-    caller already has it (from that camera's entry in
-    _camera_subscriptions, populated once when its subscriptions were
-    first resynced, since it doesn't change between events for a given
-    camera). This removes one full tool round-trip (and the associated
-    model reasoning step) from every motion notification.
+    Does NOT ask OpenClaw to fetch the snapshot itself. The caller
+    (_on_event_listener_event) already wrote it directly to
+    CAMERA_EVENTS_DIR (a real "~/camera-events" path on this same
+    machine) at alarm time, via _fetch_motion_snapshot. Trajectory review
+    (2026-07-22, 5 clean runs) showed OpenClaw's own
+    camera__download_snapshot_to_file step re-queries the camera's live
+    snapshot URL again, ~4.5s+ after the alarm on average once its model
+    reasoning gets around to calling it - since that endpoint returns
+    whatever the camera sees at request time, not a buffered frame from
+    the alarm, that second fetch can be a materially different moment
+    than the one that actually triggered the event (confirmed visually:
+    consecutive live snapshots 5s apart showed a clearly different pose).
+    Telling OpenClaw the file already exists and to just `read` it
+    removes that second fetch entirely, so the image it describes is the
+    same one captured at alarm time. This also removes one full tool
+    round-trip (and its ~4.5s model reasoning step) from every
+    notification, on top of the earlier camera__get_camera removal.
 
     Requires an openclaw.json hooks.mappings entry like:
 
@@ -299,23 +329,24 @@ def _notify_openclaw_of_motion(camera_ip: str, snapshot_uri: str, filename: str)
     present in every one of those runs, so this is a hypothesis to test
     against fresh, controlled events, not a confirmed fix.
     """
-    file_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{filename}"
-    description_path = f"$WORKSPACE_DIR/{OPENCLAW_SNAPSHOT_SUBDIR}/{Path(filename).stem}.txt"
+    file_path = f"~/{OPENCLAW_SNAPSHOT_SUBDIR}/{filename}"
+    description_path = f"~/{OPENCLAW_SNAPSHOT_SUBDIR}/{Path(filename).stem}.txt"
     payload = {
         "message": (
-            f"Motion detected on the camera at {camera_ip}. Do the following:\n"
-            f"1. Call camera__download_snapshot_to_file with url set to exactly "
-            f"\"{snapshot_uri}\" and file_path set to exactly \"{file_path}\".\n"
-            f"2. Call read on that same path to view the image.\n"
-            f"3. Write a brief description of what you see using the write "
+            f"Motion detected on the camera at {camera_ip}. A snapshot has "
+            f"already been saved to exactly \"{file_path}\" - it was captured "
+            f"at the moment of the alarm, so use it as-is. Do the following:\n"
+            f"1. Call read on \"{file_path}\" to view the image.\n"
+            f"2. Write a brief description of what you see using the write "
             f"tool, saving it to exactly \"{description_path}\" as plain "
             f"text (just the description itself, no extra formatting).\n"
-            f"4. Call camera__send_message_to_openclaw_chat with message set to "
-            f"exactly that same description.\n"            
-            "Do not call camera__get_camera or any other camera tool to look up "
-            "the snapshot URL - it is already given above. Do not use "
+            f"3. Call camera__send_message_to_openclaw_chat with message set to "
+            f"exactly that same description.\n"
+            "Do not call camera__get_camera, camera__download_snapshot_to_file, "
+            "or any other camera tool to fetch or look up the snapshot - it is "
+            "already saved at the path above. Do not use "
             "get_snapshot_image_base64_encoded or the browser tool for this - "
-            "go directly to download_snapshot_to_file, then read."
+            "go directly to read."
         ),
     }
     try:
@@ -415,17 +446,34 @@ def _on_event_listener_event(alarms: list[dict]) -> None:
             logger.error(f"Received event for camera at {camera_ip}, which has no tracked subscription; ignoring.")
             continue
 
-        if alarm.get("topic") != "VideoSource/MotionAlarm":
+        topic = alarm.get("topic")
+        state = alarm.get("data", {}).get("State")
+        logger.info(f"Alarm received: camera={camera_ip} topic={topic} state={state}")
+
+        if topic != "VideoSource/MotionAlarm":
             continue
 
         camera = entry["camera"]
-        is_motion = str(alarm.get("data", {}).get("State", "")).lower() == "true"
+        is_motion = str(state).lower() == "true"
         event_type = "motion_true" if is_motion else "motion_false"
         filename = _build_snapshot_filename(camera_ip, event_type)
 
         if is_motion:
-            _fetch_motion_snapshot(camera, filename)
-            _notify_openclaw_of_motion(camera_ip, camera.profiles[0].snapshot_uri, filename)
+            pull_start = time.perf_counter()
+            _fetch_motion_snapshot(camera, filename, directory=CAMERA_EVENTS_DIR)
+            pull_elapsed_s = time.perf_counter() - pull_start
+            logger.info(
+                f"Snapshot pull timing: camera={camera_ip} filename={filename} "
+                f"elapsed={pull_elapsed_s:.3f}s"
+            )
+
+            notify_start = time.perf_counter()
+            _notify_openclaw_of_motion(camera_ip, filename)
+            notify_elapsed_s = time.perf_counter() - notify_start
+            logger.info(
+                f"OpenClaw notify timing: camera={camera_ip} filename={filename} "
+                f"elapsed={notify_elapsed_s:.3f}s"
+            )
         else:
             _save_empty_motion_marker(filename)
 
@@ -1780,7 +1828,8 @@ async def stream_camera(camera_device_information_serial_number: str, camera_med
         A message indicating success or failure
     """
     #http://10.1.1.76:8889/AMC014641NE6L35AT8/MediaProfile000
-    url = f"http://{os.environ.get("STREAM_SERVER_IP")}:8889/{camera_device_information_serial_number}/{camera_media_profile_token}"
+    stream_server_ip = os.environ.get("STREAM_SERVER_IP")
+    url = f"http://{stream_server_ip}:8889/{camera_device_information_serial_number}/{camera_media_profile_token}"
     opened = webbrowser.open(url)
     if opened:
         return f"Opened {url} in default browser."
@@ -1848,7 +1897,9 @@ async def show_snapshot_in_browser(url: str) -> str:
     if not (url.startswith("http://") or url.startswith("https://")):
         return f"Refused to open '{url}': must start with http:// or https://"
 
-    curl = f"{url[:7]}{os.environ.get("CAMERA_USERNAME", "")}:{os.environ.get("CAMERA_PASSWORD", "")}@{url[7:]}"
+    camera_username = os.environ.get("CAMERA_USERNAME", "")
+    camera_password = os.environ.get("CAMERA_PASSWORD", "")
+    curl = f"{url[:7]}{camera_username}:{camera_password}@{url[7:]}"
     opened = webbrowser.open(curl)
     if opened:
         return f"Opened {url} in default browser."
