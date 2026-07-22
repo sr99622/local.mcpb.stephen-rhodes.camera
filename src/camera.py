@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import json
 import logging
@@ -24,7 +26,9 @@ import webbrowser
 import niquests as requests
 from niquests.auth import HTTPDigestAuth
 import re
-
+import shutil
+import subprocess
+from typing import Any
 
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -69,73 +73,124 @@ OPENCLAW_HOOK_TOKEN = os.environ.get("OPENCLAW_HOOK_TOKEN", "")
 OPENCLAW_SNAPSHOT_SUBDIR = "camera-events"
 
 # The one shared EventServer instance, or None until the first camera
-# adds a subscribed event. Created by _resync_camera_subscriptions.
+# adds a subscribed event. Created by _ensure_camera_subscription_entry.
 _event_server = None
 
 # Per-camera state, keyed by IP address: {"camera": Camera, "subscription_manager": SubscriptionManager}.
 # Populated lazily, the first time a given camera's subscriptions are
-# resynced. The Camera object here is queried once and then reused
+# touched. The Camera object here is queried once and then reused
 # across resyncs (its subscription_references list is what actually
 # tracks live ONVIF subscriptions) - it is NOT refreshed automatically,
 # so if a camera's IP/credentials/xaddr genuinely change, its entry here
 # would need to be rebuilt (not handled yet - a later concern).
 _camera_subscriptions: dict[str, dict] = {}
 
-# Persistent store, keyed by camera IP address, for the set of event
+# In-memory store, keyed by camera IP address, for the set of event
 # topics the user wants that camera marked for observation on. Kept
 # deliberately separate from _event_server/_camera_subscriptions above:
 # those track live ONVIF subscription state (built lazily, in memory
 # only), while this needs to hold user preferences for potentially many
-# cameras that survive both a server restart and rediscovery (nothing
-# stored on the Camera object itself persists across get_cameras() calls,
-# which rediscovers cameras fresh every time).
+# cameras (nothing stored on the Camera object itself persists across
+# get_cameras() calls, which rediscovers cameras fresh every time).
 #
-# Also persisted to disk (SUBSCRIBED_EVENTS_FILE) so these preferences
-# survive a server restart, not just repeated calls within one running
-# process - loaded once at import time below, and rewritten after every
-# add/remove so the file never falls out of sync with what's in memory.
-SUBSCRIBED_EVENTS_FILE = Path(__file__).parent / "subscribed_events.json"
+# This does not survive a server restart - it is reset to empty on
+# every process start.
+_subscribed_events_by_camera: dict[str, list[str]] = {}
 
+OPENCLAW_CHAT_SESSION_KEY = "agent:main:main"
 
-def _load_subscribed_events_from_disk() -> dict[str, list[str]]:
+@mcp.tool()
+async def send_message_to_openclaw_chat(
+    message: str,
+    session_key: str = OPENCLAW_CHAT_SESSION_KEY,
+) -> str:
     """
-    Load the persisted subscribed-events store from disk. Returns an
-    empty dict if the file doesn't exist yet (first run) or can't be
-    parsed (corrupt/manually-edited file) - this is a preferences cache,
-    not critical data, so a bad file should not prevent the server from
-    starting.
+    Inject an assistant message into an OpenClaw WebChat session.
+
+    Args:
+        message:
+            Text to display in the OpenClaw chat.
+
+        session_key:
+            OpenClaw session receiving the message. The normal main-agent
+            session is commonly "agent:main:main".
+
+    Returns:
+        A status message describing the result.
+
+    Raises:
+        ValueError:
+            If message or session_key is empty.
+
+        RuntimeError:
+            If the OpenClaw CLI cannot be found or the RPC call fails.
     """
-    if not SUBSCRIBED_EVENTS_FILE.exists():
-        return {}
+    message = message.strip()
+    session_key = session_key.strip()
+
+    if not message:
+        raise ValueError("message cannot be empty")
+
+    if not session_key:
+        raise ValueError("session_key cannot be empty")
+
+    openclaw_executable = shutil.which("openclaw")
+
+    if openclaw_executable is None:
+        raise RuntimeError("The openclaw executable was not found in PATH")
+
+    params = json.dumps(
+        {
+            "sessionKey": session_key,
+            "message": message,
+        }
+    )
+
+    command = [
+        openclaw_executable,
+        "gateway",
+        "call",
+        "chat.inject",
+        "--params",
+        params,
+        "--json",
+    ]
+
     try:
-        with open(SUBSCRIBED_EVENTS_FILE, "r") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            logger.error(f"{SUBSCRIBED_EVENTS_FILE} did not contain a JSON object; ignoring.")
-            return {}
-        return data
-    except Exception as e:
-        logger.error(f"Failed to load {SUBSCRIBED_EVENTS_FILE}: {e}")
-        return {}
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("OpenClaw chat.inject timed out") from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Unable to run the OpenClaw CLI: {exc}"
+        ) from exc
 
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
 
-def _save_subscribed_events_to_disk() -> None:
-    """
-    Persist the current subscribed-events store to disk. Called after
-    every add/remove so the on-disk copy never falls out of sync with
-    what's in memory. Failures are logged but not raised - a failed save
-    shouldn't break the add/remove tool call itself, just means the
-    change won't survive a restart.
-    """
+        details = stderr or stdout or "no diagnostic output"
+
+        raise RuntimeError(
+            f"OpenClaw chat.inject failed with exit code "
+            f"{completed.returncode}: {details}"
+        )
+
     try:
-        with open(SUBSCRIBED_EVENTS_FILE, "w") as f:
-            json.dump(_subscribed_events_by_camera, f, indent=4)
-    except Exception as e:
-        logger.error(f"Failed to save {SUBSCRIBED_EVENTS_FILE}: {e}")
+        response: Any = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        response = completed.stdout.strip()
 
-
-_subscribed_events_by_camera: dict[str, list[str]] = _load_subscribed_events_from_disk()
-
+    return (
+        f"Message injected into OpenClaw session "
+        f"{session_key}: {response}"
+    )
 
 def _build_snapshot_filename(camera_ip: str, event_type: str) -> str:
     """
@@ -255,6 +310,8 @@ def _notify_openclaw_of_motion(camera_ip: str, snapshot_uri: str, filename: str)
             f"3. Write a brief description of what you see using the write "
             f"tool, saving it to exactly \"{description_path}\" as plain "
             f"text (just the description itself, no extra formatting).\n"
+            f"4. Call camera__send_message_to_openclaw_chat with message set to "
+            f"exactly that same description.\n"            
             "Do not call camera__get_camera or any other camera tool to look up "
             "the snapshot URL - it is already given above. Do not use "
             "get_snapshot_image_base64_encoded or the browser tool for this - "
@@ -274,29 +331,13 @@ def _notify_openclaw_of_motion(camera_ip: str, snapshot_uri: str, filename: str)
         logger.error(f"Failed to notify OpenClaw: {e}")
 
 
-def _resync_camera_subscriptions(ip_address: str) -> None:
+def _ensure_camera_subscription_entry(ip_address: str) -> dict:
     """
-    Reconcile a camera's real ONVIF push subscriptions with whatever is
-    currently in _subscribed_events_by_camera for it.
-
-    ONVIF only offers Unsubscribe, which removes ALL of a camera's push
-    subscriptions at once - there is no operation to target a single
-    topic while leaving others active. So rather than having add/remove
-    take two different paths against the camera's real subscription
-    state (which could drift apart or handle edge cases differently),
-    both funnel through this one function: unsubscribe everything for
-    this camera, then resubscribe to exactly the topics currently in its
-    bookkeeping list. Called after the bookkeeping list has already been
-    updated to reflect the desired end state.
-
-    Ensures the shared EventServer exists first (starting it on the very
-    first call across any camera), and this camera's own
-    SubscriptionManager exists (creating it, and querying the camera
-    fresh, the first time this particular camera is resynced).
-
-    Raises on failure (e.g. camera unreachable) rather than swallowing
-    the error, so callers can decide whether to roll back their
-    bookkeeping change.
+    Ensure the shared EventServer exists (starting it on the very first
+    call across any camera) and this camera's own SubscriptionManager
+    exists (creating it, and querying the camera fresh, the first time
+    this particular camera is touched). Returns the _camera_subscriptions
+    entry for this camera.
     """
     global _event_server
 
@@ -315,14 +356,34 @@ def _resync_camera_subscriptions(ip_address: str) -> None:
             "subscription_manager": SubscriptionManager(camera),
         }
 
-    entry = _camera_subscriptions[ip_address]
+    return _camera_subscriptions[ip_address]
+
+
+def _subscribe_camera_event_topic(ip_address: str, event_topic: str) -> None:
+    """
+    Subscribe a camera to a single ONVIF event topic, mirroring the real
+    ONVIF Subscribe operation directly - it does not touch any of the
+    camera's other active push subscriptions.
+    """
+    entry = _ensure_camera_subscription_entry(ip_address)
+    camera = entry["camera"]
+    subscription_manager = entry["subscription_manager"]
+
+    subscription_manager.subscribe_push_event(camera, "0.0.0.0", EVENT_SERVER_PORT, event_topic)
+
+
+def _unsubscribe_camera_events(ip_address: str) -> None:
+    """
+    Unsubscribe a camera from ALL of its ONVIF push subscriptions,
+    mirroring the real ONVIF Unsubscribe operation directly - ONVIF has
+    no operation to target a single topic while leaving others active,
+    so this always clears everything for the camera at once.
+    """
+    entry = _ensure_camera_subscription_entry(ip_address)
     camera = entry["camera"]
     subscription_manager = entry["subscription_manager"]
 
     subscription_manager.unsubscribe_events(camera)
-
-    for topic in _subscribed_events_by_camera.get(ip_address, []):
-        subscription_manager.subscribe_push_event(camera, "0.0.0.0", EVENT_SERVER_PORT, topic)
 
 
 def _on_event_listener_event(alarms: list[dict]) -> None:
@@ -335,7 +396,7 @@ def _on_event_listener_event(alarms: list[dict]) -> None:
 
     Still only ACTS on VideoSource/MotionAlarm for now, even though a
     camera may genuinely be subscribed to other topics too (subscribing
-    itself is already fully general as of _resync_camera_subscriptions
+    itself is already fully general via _subscribe_camera_event_topic
     above) - generalizing this handling logic to other topics is a
     separate, later step. Events on any other topic are received here
     but currently just ignored.
@@ -1987,19 +2048,13 @@ async def add_subscribed_event(ip_address: str, event_topic: str) -> str:
 
     Updates this server's own bookkeeping (visible afterward as that
     camera's subscribed_events list in get_cameras) AND performs the
-    real ONVIF subscription on the camera itself.
-
-    Internally this always does a full resync rather than an incremental
-    add: ONVIF only offers Unsubscribe, which removes ALL of a camera's
-    push subscriptions at once - there is no way to unsubscribe a single
-    topic while leaving others active. So both this tool and
-    remove_subscribed_event share one path (_resync_camera_subscriptions):
-    unsubscribe everything for this camera, then resubscribe to every
-    topic currently in its subscribed_events list. This keeps add and
-    remove from ever handling the camera's real subscription state
-    differently. All cameras share one underlying event listener - the
-    first call to either tool, for any camera, starts it; every
-    subsequent call (for that camera or any other) reuses it.
+    real ONVIF subscription on the camera itself - adding just this one
+    topic, without touching any of the camera's other active
+    subscriptions (this mirrors ONVIF's own Subscribe operation, which
+    is likewise additive/per-topic). All cameras share one underlying
+    event listener - the first call to this tool or
+    unsubscribe_all_events, for any camera, starts it; every subsequent
+    call (for that camera or any other) reuses it.
 
     If the real subscription fails (e.g. the camera is unreachable), the
     bookkeeping change is rolled back rather than left showing a topic
@@ -2025,61 +2080,54 @@ async def add_subscribed_event(ip_address: str, event_topic: str) -> str:
         return f"{event_topic} is already in the subscribed_events list for camera at {ip_address}. Current list: {events}"
 
     events.append(event_topic)
-    _save_subscribed_events_to_disk()
 
     try:
-        _resync_camera_subscriptions(ip_address)
+        _subscribe_camera_event_topic(ip_address, event_topic)
         return f"Added {event_topic} to the subscribed_events list for camera at {ip_address}, and subscribed on the camera. Current list: {events}"
     except Exception as e:
         events.remove(event_topic)
-        _save_subscribed_events_to_disk()
         logger.error(f"Failed to subscribe camera at {ip_address} to {event_topic}: {e}")
         return f"Failed to subscribe camera at {ip_address} to {event_topic}: {e}"
 
 @mcp.tool()
-async def remove_subscribed_event(ip_address: str, event_topic: str) -> str:
+async def unsubscribe_all_events(ip_address: str) -> str:
     """
-    Unsubscribe a camera from an ONVIF event topic and remove it from
-    observation.
+    Unsubscribe a camera from ALL of its ONVIF event topics and clear it
+    from observation.
 
     Updates this server's own bookkeeping (visible afterward as that
     camera's subscribed_events list in get_cameras) AND performs the
-    real ONVIF unsubscription on the camera itself.
+    real ONVIF unsubscription on the camera itself. This mirrors ONVIF's
+    own Unsubscribe operation directly: it has no way to target a single
+    subscription while leaving others active, so it always removes every
+    push subscription for the camera at once. To resume observing any
+    topics afterward, call add_subscribed_event again for each one.
 
-    See add_subscribed_event for why this always does a full resync
-    (unsubscribe everything for this camera, then resubscribe to every
-    remaining topic) rather than removing just this one topic - ONVIF's
-    Unsubscribe operation has no way to target a single subscription
-    while leaving others active.
-
-    If the resync fails, the bookkeeping change is rolled back rather
-    than left showing a topic as unsubscribed when the camera might
-    still be sending it.
+    If the real unsubscription fails (e.g. the camera is unreachable),
+    the bookkeeping change is rolled back rather than left showing an
+    empty subscribed_events list when the camera might still be sending
+    events.
 
     Args:
         ip_address: The IP address of the camera.
-        event_topic: The event topic string to remove, exactly as it
-                     currently appears in that camera's subscribed_events
-                     list (from get_cameras).
 
     Returns:
         A message indicating the result, including the resulting list.
     """
     events = _subscribed_events_by_camera.get(ip_address, [])
-    if event_topic not in events:
-        return f"{event_topic} is not in the subscribed_events list for camera at {ip_address}. Current list: {events}"
+    if not events:
+        return f"Camera at {ip_address} has no subscribed events. Current list: {events}"
 
-    events.remove(event_topic)
-    _save_subscribed_events_to_disk()
+    previous_events = list(events)
+    events.clear()
 
     try:
-        _resync_camera_subscriptions(ip_address)
-        return f"Removed {event_topic} from the subscribed_events list for camera at {ip_address}, and unsubscribed on the camera. Current list: {events}"
+        _unsubscribe_camera_events(ip_address)
+        return f"Unsubscribed camera at {ip_address} from all events. Current list: {events}"
     except Exception as e:
-        events.append(event_topic)
-        _save_subscribed_events_to_disk()
-        logger.error(f"Failed to unsubscribe camera at {ip_address} from {event_topic}: {e}")
-        return f"Failed to unsubscribe camera at {ip_address} from {event_topic}: {e}"
+        events.extend(previous_events)
+        logger.error(f"Failed to unsubscribe camera at {ip_address} from all events: {e}")
+        return f"Failed to unsubscribe camera at {ip_address} from all events: {e}"
 
 
 def main():
