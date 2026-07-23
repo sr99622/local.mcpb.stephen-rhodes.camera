@@ -1835,6 +1835,24 @@ async def stream_camera(camera_device_information_serial_number: str, camera_med
         return f"Opened {url} in default browser."
     else:
         return f"Failed to open {url}."
+
+@mcp.tool()
+async def get_web_player_url(camera_device_information_serial_number: str, camera_media_profile_token: str) -> str:
+    """
+    Get the web-player URL for a camera live stream without opening a browser.
+
+    Args:
+        camera_device_information_serial_number: The camera serial number found in the ONVIF data of the camera
+                                                 that is stored in the device_information topic group.
+
+        camera_media_profile_token: The media profile token found in the ONVIF data topic profiles. The default choice
+                                    should be the first profile.
+
+    Returns:
+        The web-player URL for the requested camera and media profile.
+    """
+    stream_server_ip = os.environ.get("STREAM_SERVER_IP")
+    return f"http://{stream_server_ip}:8889/{camera_device_information_serial_number}/{camera_media_profile_token}"
     
 @mcp.tool()
 async def get_snapshot_image_base64_encoded(url: str) -> str:
